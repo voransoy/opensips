@@ -1971,6 +1971,7 @@ static void trace_onreply_in(struct cell* t, int type, struct tmcb_params *ps)
 	char statusbuf[INT2STR_MAX_LEN];
 	int len;
 	trace_info_t info;
+	char *str_code;
 
 	if(t==NULL || t->uas.request==0 || ps==NULL)
 	{
@@ -2025,7 +2026,7 @@ static void trace_onreply_in(struct cell* t, int type, struct tmcb_params *ps)
 
 	db_vals[2].val.str_val= get_cseq(msg)->method;
 
-	char * str_code = int2str(ps->code, &len);
+	str_code = int2str(ps->code, &len);
 	statusbuf[INT2STR_MAX_LEN-1]=0;
 	strncpy(statusbuf, str_code, len >= INT2STR_MAX_LEN ? INT2STR_MAX_LEN-1 : len);
 	db_vals[3].val.str_val.s = statusbuf;
@@ -2087,6 +2088,7 @@ static void trace_onreply_out(struct cell* t, int type, struct tmcb_params *ps)
 	char statusbuf[8];
 	str *sbuf;
 	struct dest_info *dst;
+	char *str_code;
 
 	trace_info_t info;
 
@@ -2160,7 +2162,9 @@ static void trace_onreply_out(struct cell* t, int type, struct tmcb_params *ps)
 	db_vals[2].val.str_val.s = t->method.s;
 	db_vals[2].val.str_val.len = t->method.len;
 
-	strcpy(statusbuf, int2str(ps->code, &len));
+	str_code = int2str(ps->code, &len);
+	statusbuf[INT2STR_MAX_LEN-1]=0;
+	strncpy(statusbuf, str_code, len >= INT2STR_MAX_LEN ? INT2STR_MAX_LEN-1 : len);
 	db_vals[3].val.str_val.s = statusbuf;
 	db_vals[3].val.str_val.len = len;
 
@@ -2195,6 +2199,7 @@ static void trace_onreply_out(struct cell* t, int type, struct tmcb_params *ps)
 		}
 	}
 
+	memset(&to_ip, 0, sizeof(struct ip_addr));
 	if(dst==0)
 	{
 		set_columns_to_any( db_vals[7], db_vals[8], db_vals[9]);
