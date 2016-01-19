@@ -649,6 +649,7 @@ struct mi_root* mi_xmlrpc_http_run_mi_cmd(const str* arg,
 	if (mi_cmd) free_mi_tree(mi_cmd);
 	if(doc) xmlFree(doc);
 	doc=NULL;
+	if(esc_val.s) shm_free(esc_val.s);
 	return mi_rpl;
 
 xml_error:
@@ -663,6 +664,7 @@ xml_error:
 	*async_hdl = NULL;
 	if(doc) xmlFree(doc);
 	doc=NULL;
+	if(esc_val.s) shm_free(esc_val.s);
 	return NULL;
 }
 
