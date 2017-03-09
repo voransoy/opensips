@@ -2391,9 +2391,7 @@ int mid_reg_save(struct sip_msg *msg, char *dom, char *flags_gp,
 	if (get_first_contact(msg) == NULL) {
 		if (st)
 			sctx.star = 1;
-			return prepare_forward(msg, ud, &sctx);
-		}
-		goto quick_reply;
+		return prepare_forward(msg, ud, &sctx.aor, &sctx);
 	}
 
 	/* in mirror mode, all REGISTER requests simply pass through */
