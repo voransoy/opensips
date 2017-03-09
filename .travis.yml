@@ -42,6 +42,6 @@ addons:
       version: master
       description: OpenSIPS Coverity Scan
     notification_email: razvan@opensips.org
-    build_command: make all
+    build_command: make exclude_modules="db_oracle osp sngtc cachedb_cassandra cachedb_couchbase cachedb_mongodb" all
     branch_pattern: coverity_scan
-script:  if [ ${COVERITY_SCAN_BRANCH} != 1 ]; then make all; fi
+script:  if [ ${COVERITY_SCAN_BRANCH} != 1 ]; then make exclude_modules="db_oracle osp sngtc cachedb_cassandra cachedb_couchbase cachedb_mongodb" all; fi
