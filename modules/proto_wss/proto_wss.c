@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <netinet/tcp.h>
+#include <sys/uio.h>
 #include <poll.h>
 
 #include "../../pt.h"
@@ -334,7 +335,7 @@ static int proto_wss_send(struct socket_info* send_sock,
 
 	if (n<0) {
 		/* error during conn get, return with error too */
-		LM_ERR("failed to aquire connection\n");
+		LM_ERR("failed to acquire connection\n");
 		get_time_difference(get,tcpthreshold,tcp_timeout_con_get);
 		return -1;
 	}

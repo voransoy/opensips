@@ -53,6 +53,8 @@
 #include "../../mod_fix.h"
 #include "../../db/db.h"
 
+#include "../freeswitch/fs_api.h"
+
 #include "dispatch.h"
 #include "ds_bl.h"
 #include "ds_fixups.h"
@@ -81,6 +83,8 @@ int probing_threshhold = 3; /* number of failed requests, before a destination
 str ds_ping_method = {"OPTIONS",7};
 str ds_ping_from   = {"sip:dispatcher@localhost", 24};
 static int ds_ping_interval = 0;
+/* no MAX-FWD enforced from the module */
+int ds_ping_maxfwd = -1;
 int ds_probing_mode = 0;
 int ds_persistent_state = 1;
 int_list_t *ds_probing_list = NULL;
@@ -157,6 +161,8 @@ ds_partition_t *partitions = NULL, *default_partition = NULL;
 static str dispatcher_event = str_init("E_DISPATCHER_STATUS");
 event_id_t dispatch_evi_id;
 
+int fetch_freeswitch_stats;
+int max_freeswitch_weight = 100;
 
 /** module functions */
 static int mod_init(void);
@@ -260,12 +266,15 @@ static param_export_t params[]={
 	{"ds_ping_method",        STR_PARAM, &ds_ping_method.s},
 	{"ds_ping_from",          STR_PARAM, &ds_ping_from.s},
 	{"ds_ping_interval",      INT_PARAM, &ds_ping_interval},
+	{"ds_ping_maxfwd",        INT_PARAM, &ds_ping_maxfwd},
 	{"ds_probing_mode",       INT_PARAM, &ds_probing_mode},
 	{"options_reply_codes",   STR_PARAM, &options_reply_codes_str.s},
 	{"ds_probing_sock",       STR_PARAM, &probing_sock_s},
 	{"ds_probing_list",       STR_PARAM|USE_FUNC_PARAM, (void*)set_probing_list},
 	{"ds_define_blacklist",   STR_PARAM|USE_FUNC_PARAM, (void*)set_ds_bl},
 	{"persistent_state",      INT_PARAM, &ds_persistent_state},
+	{"fetch_freeswitch_stats", INT_PARAM, &fetch_freeswitch_stats},
+	{"max_freeswitch_weight", INT_PARAM, &max_freeswitch_weight},
 	{0,0,0}
 };
 
@@ -275,6 +284,14 @@ static module_dependency_t *get_deps_ds_ping_interval(param_export_t *param)
 		return NULL;
 
 	return alloc_module_dep(MOD_TYPE_DEFAULT, "tm", DEP_ABORT);
+}
+
+static module_dependency_t *get_deps_fetch_fs_load(param_export_t *param)
+{
+	if (*(int *)param->param_pointer <= 0)
+		return NULL;
+
+	return alloc_module_dep(MOD_TYPE_DEFAULT, "freeswitch", DEP_ABORT);
 }
 
 static mi_export_t mi_cmds[] = {
@@ -290,7 +307,8 @@ static dep_export_t deps = {
 		{ MOD_TYPE_NULL, NULL, 0 },
 	},
 	{ /* modparam dependencies */
-		{ "ds_ping_interval", get_deps_ds_ping_interval },
+		{ "ds_ping_interval",      get_deps_ds_ping_interval },
+		{ "fetch_freeswitch_stats", get_deps_fetch_fs_load },
 		{ NULL, NULL },
 	},
 };
@@ -422,7 +440,7 @@ static int parse_partition_argument(str *arg, ds_db_head_t **found_head)
 
 	ds_db_head_t *new_partition = pkg_malloc(sizeof (ds_db_head_t));
 	if (new_partition == NULL) {
-		LM_ERR("failed to alocate data in shm\n");
+		LM_ERR("failed to allocate data in shm\n");
 		return -1;
 	}
 
@@ -725,6 +743,12 @@ static int mod_init(void)
 	ds_dest_weight_col.len = strlen(ds_dest_weight_col.s);
 	ds_dest_attrs_col.len = strlen(ds_dest_attrs_col.s);
 
+	if (fetch_freeswitch_stats) {
+		if (load_fs_api(&fs_api) == -1) {
+			LM_ERR("failed to load the FS API!\n");
+			return -1;
+		}
+	}
 
 	if(hash_pvar_param.s && (hash_pvar_param.len=strlen(hash_pvar_param.s))>0){
 		if(pv_parse_format(&hash_pvar_param, &hash_param_model) < 0
@@ -848,6 +872,14 @@ static int mod_init(void)
 		if (register_timer("ds-pinger", ds_check_timer, NULL,
 		ds_ping_interval, TIMER_FLAG_DELAY_ON_DELAY)<0) {
 			LM_ERR("failed to register timer for probing!\n");
+			return -1;
+		}
+
+		/* Register the weight-recalculation timer */
+		if (fetch_freeswitch_stats &&
+		    register_timer("ds-update-weights", ds_update_weights, NULL,
+		                   FS_HEARTBEAT_ITV, TIMER_FLAG_SKIP_ON_DELAY)<0) {
+			LM_ERR("failed to register timer for weight recalc!\n");
 			return -1;
 		}
 	}
@@ -1448,7 +1480,7 @@ static int w_ds_is_in_list(struct sip_msg *msg,char *ip,char *port,char *set,
 					return -1;
 				}
 				if (tmp_lst->next != NULL) {
-					LM_ERR("Only one set is allowd\n");
+					LM_ERR("Only one set is allowed\n");
 					return -1;
 				}
 				i_set = tmp_lst->v.ival;

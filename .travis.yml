@@ -39,7 +39,7 @@ addons:
   coverity_scan:
     project:
       name: OpenSIPS/opensips
-      version: 2.2
+      version: master
       description: OpenSIPS Coverity Scan
     notification_email: razvan@opensips.org
     build_command: make all

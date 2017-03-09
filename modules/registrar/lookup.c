@@ -40,6 +40,7 @@
 #include "../../parser/parse_rr.h"
 #include "../usrloc/usrloc.h"
 #include "../../parser/parse_from.h"
+#include "../../lib/reg/sip_msg.h"
 #include "common.h"
 #include "regtime.h"
 #include "reg_mod.h"
@@ -419,7 +420,7 @@ struct to_body* select_uri(struct sip_msg* _m)
 
 	} else {
 		/* WARNING in msg_aor_parse the to header is checked in
-		 * parse_message so no need to check it; take care when
+		 * parse_reg_headers so no need to check it; take care when
 		 * you use this function */
 		return get_to(_m);
 	}
@@ -449,7 +450,7 @@ int msg_aor_parse(struct sip_msg* _m, char *_aor, str *_saor)
 	pv_value_t val;
 	struct to_body *hdr;
 
-	if (parse_message(_m) < 0) {
+	if (parse_reg_headers(_m) < 0) {
 		LM_ERR("unable to parse message\n");
 		return -2;
 	}
@@ -556,8 +557,10 @@ int is_contact_registered(struct sip_msg* _m, char *_d, char* _a,
 {
 	int exp;
 
-	str aor;
-	str curi, callid;
+	str aor, callid;
+	/* make gcc happy */
+	str curi = { 0, 0};
+	pv_value_t val;
 
 	udomain_t* ud = (udomain_t*)_d;
 	urecord_t* r;
@@ -594,17 +597,23 @@ int is_contact_registered(struct sip_msg* _m, char *_d, char* _a,
 		curi = ct->uri;
 	} else {
 		if (_c) {
-			if (fixup_get_svalue(_m, (gparam_p)_c, &curi) != 0) {
-				LM_ERR("failed to retrieve contact value from pv!\n");
+			if (pv_get_spec_value(_m, (pv_spec_p)_c, &val)!=0 ||
+			(val.flags&PV_VAL_STR)==0 ) {
+				LM_ERR("failed to retrieve string value from CONTACT "
+					"parameter!\n");
 				return -1;
 			}
+			curi = val.rs;
 		}
 
 		if (_cid) {
-			if (fixup_get_svalue(_m, (gparam_p)_cid, &callid) != 0) {
-				LM_ERR("failed to retrieve contact value from pv!\n");
+			if (pv_get_spec_value(_m, (pv_spec_p)_cid, &val)!=0 ||
+			(val.flags&PV_VAL_STR)==0 ) {
+				LM_ERR("failed to retrieve string value from CALLID "
+					"parameter!\n");
 				return -1;
 			}
+			callid = val.rs;
 		}
 	}
 

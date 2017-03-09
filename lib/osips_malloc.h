@@ -1,7 +1,7 @@
 /*
- * Registrar errno
+ * OpenSIPS equivalent of the stdlib allocation functions
  *
- * Copyright (C) 2001-2003 FhG Fokus
+ * Copyright (C) 2017 OpenSIPS Project
  *
  * This file is part of opensips, a free SIP server.
  *
@@ -20,14 +20,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
-/*!
- * \file
- * \brief SIP registrar module - registrar errno
- * \ingroup registrar
- */
+#ifndef __OSIPS_MALLOC_H__
+#define __OSIPS_MALLOC_H__
 
+void *osips_pkg_malloc(size_t size);
+void osips_pkg_free(void *ptr);
+void *osips_pkg_calloc(size_t nmemb, size_t size);
+void *osips_pkg_realloc(void *ptr, size_t size);
+char *osips_pkg_strdup(const char *s);
 
-#include "rerrno.h"
+void *osips_shm_malloc(size_t size);
+void osips_shm_free(void *ptr);
+void *osips_shm_calloc(size_t nmemb, size_t size);
+void *osips_shm_realloc(void *ptr, size_t size);
+char *osips_shm_strdup(const char *s);
 
-rerr_t rerrno;
-
+#endif /* __OSIPS_MALLOC_H__ */

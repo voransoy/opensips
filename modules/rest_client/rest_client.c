@@ -33,6 +33,8 @@
 #include "../../mem/mem.h"
 #include "../../mem/shm_mem.h"
 #include "../../mod_fix.h"
+#include "../../lib/list.h"
+#include "../../trace_api.h"
 
 #include "rest_methods.h"
 
@@ -42,19 +44,31 @@
 long connection_timeout = 20; /* s */
 long connect_poll_interval = 20; /* ms */
 long connection_timeout_ms;
+int max_async_transfers = 100;
 long curl_timeout = 20;
-
 char *ssl_capath;
+
+/*
+ * curl_multi_perform() may indicate a "try again" response even
+ * when resuming transfers with pending data
+ */
+int _async_resume_retr_timeout = 500000; /* us */
+int _async_resume_retr_itv = 100; /* us */
 
 /* libcurl enables these by default */
 int ssl_verifypeer = 1;
 int ssl_verifyhost = 1;
 
+/* trace parameters for this module */
+#define REST_TRACE_API_MODULE "proto_hep"
+int rest_proto_id;
+trace_proto_t tprot;
+static char* rest_id_s = "rest";
+
 /*
  * Module initialization and cleanup
  */
 static int mod_init(void);
-static int child_init(int rank);
 static void mod_destroy(void);
 
 /*
@@ -74,17 +88,27 @@ static int w_rest_post(struct sip_msg *msg, char *gp_url, char *gp_body,
 static int w_rest_put(struct sip_msg *msg, char *gp_url, char *gp_body,
 				char *gp_ctype, char *body_pv, char *ctype_pv, char *code_pv);
 
-static int w_async_rest_get(struct sip_msg *msg, async_resume_module **resume_f,
-							void **resume_param, char *gp_url,
-							char *body_pv, char *ctype_pv, char *code_pv);
-static int w_async_rest_post(struct sip_msg *msg, async_resume_module **resume_f,
-					 void **resume_param, char *gp_url, char *gp_body,
-					 char *gp_ctype, char *body_pv, char *ctype_pv, char *code_pv);
-static int w_async_rest_put(struct sip_msg *msg, async_resume_module **resume_f,
-					 void **resume_param, char *gp_url, char *gp_body,
-					 char *gp_ctype, char *body_pv, char *ctype_pv, char *code_pv);
+static int w_async_rest_get(struct sip_msg *msg, async_ctx *ctx, char *gp_url,
+					 char *body_pv, char *ctype_pv, char *code_pv);
+static int w_async_rest_post(struct sip_msg *msg, async_ctx *ctx,
+					 char *gp_url, char *gp_body, char *gp_ctype,
+					 char *body_pv, char *ctype_pv, char *code_pv);
+static int w_async_rest_put(struct sip_msg *msg, async_ctx *ctx,
+					 char *gp_url, char *gp_body, char *gp_ctype,
+					 char *body_pv, char *ctype_pv, char *code_pv);
 
 static int w_rest_append_hf(struct sip_msg *msg, char *gp_hfv);
+
+/* module dependencies */
+static dep_export_t deps = {
+	{ /* OpenSIPS module dependencies */
+		{ MOD_TYPE_DEFAULT, "siptrace", DEP_SILENT },
+		{ MOD_TYPE_NULL, NULL, 0 }
+	},
+	{ /* modparam dependencies */
+		{ NULL, NULL}
+	}
+};
 
 static acmd_export_t acmds[] = {
 	{ "rest_get",  (acmd_function)w_async_rest_get,  2, fixup_rest_get },
@@ -143,6 +167,7 @@ static cmd_export_t cmds[] = {
 static param_export_t params[] = {
 	{ "connection_timeout",	INT_PARAM, &connection_timeout	},
 	{ "connect_poll_interval", INT_PARAM, &connect_poll_interval },
+	{ "max_async_transfers", INT_PARAM, &max_async_transfers },
 	{ "curl_timeout",		INT_PARAM, &curl_timeout		},
 	{ "ssl_capath",			STR_PARAM, &ssl_capath			},
 	{ "ssl_verifypeer",		INT_PARAM, &ssl_verifypeer		},
@@ -159,7 +184,7 @@ struct module_exports exports = {
 	MOD_TYPE_DEFAULT,/* class of this module */
 	MODULE_VERSION,  /* module version */
 	DEFAULT_DLFLAGS, /* dlopen flags */
-	NULL,            /* OpenSIPS module dependencies */
+	&deps,            /* OpenSIPS module dependencies */
 	cmds,     /* Exported functions */
 	acmds,    /* Exported async functions */
 	params,   /* Exported parameters */
@@ -170,28 +195,51 @@ struct module_exports exports = {
 	mod_init, /* module initialization function */
 	NULL,     /* response function*/
 	mod_destroy,
-	child_init,/* per-child init function */
+	NULL,     /* per-child init function */
 };
+
+/*
+ * Since libcurl's "easy" interface spawns a separate thread to perform each
+ * transfer, we supply it with a set of allocation functions which make
+ * everyone happy:
+ *  - thread-safe
+ *  - faster than libc's malloc()
+ *  - integrated with OpenSIPS's memory usage reporting
+ */
+static gen_lock_t thread_lock;
 
 static void *osips_malloc(size_t size)
 {
-	void *p = pkg_malloc(size);
+	void *p;
+
+	lock_get(&thread_lock);
+	p = pkg_malloc(size);
+	lock_release(&thread_lock);
 
 	return p;
 }
 
 static void *osips_calloc(size_t nmemb, size_t size)
 {
-	void *p = pkg_malloc(nmemb * size);
-	if (p)
+	void *p;
+
+	lock_get(&thread_lock);
+	p = pkg_malloc(nmemb * size);
+	lock_release(&thread_lock);
+	if (p) {
 		memset(p, '\0', nmemb * size);
+	}
 
 	return p;
 }
 
 static void *osips_realloc(void *ptr, size_t size)
 {
-	void *p = pkg_realloc(ptr, size);
+	void *p;
+
+	lock_get(&thread_lock);
+	p = pkg_realloc(ptr, size);
+	lock_release(&thread_lock);
 
 	return p;
 }
@@ -202,9 +250,13 @@ static char *osips_strdup(const char *cp)
 	int len;
 
 	len = strlen(cp) + 1;
+
+	lock_get(&thread_lock);
 	rval = pkg_malloc(len);
-	if (!rval)
+	lock_release(&thread_lock);
+	if (!rval) {
 		return NULL;
+	}
 
 	memcpy(rval, cp, len);
 	return rval;
@@ -212,8 +264,11 @@ static char *osips_strdup(const char *cp)
 
 static void osips_free(void *ptr)
 {
-	if (ptr)
+	lock_get(&thread_lock);
+	if (ptr) {
 		pkg_free(ptr);
+	}
+	lock_release(&thread_lock);
 }
 
 static int mod_init(void)
@@ -228,6 +283,8 @@ static int mod_init(void)
 		connect_poll_interval = 20;
 	}
 
+	lock_init(&thread_lock);
+
 	curl_global_init_mem(CURL_GLOBAL_ALL,
 						 osips_malloc,
 						 osips_free,
@@ -235,23 +292,24 @@ static int mod_init(void)
 						 osips_strdup,
 						 osips_calloc);
 
-	multi_handle = curl_multi_init();
+	INIT_LIST_HEAD(&multi_pool);
+
+	/* try loading the trace api */
+	if ( register_trace_type ) {
+		rest_proto_id = register_trace_type(rest_id_s);
+		if ( global_trace_api ) {
+			memcpy( &tprot, global_trace_api, sizeof(trace_proto_t));
+		} else {
+			memset( &tprot, 0, sizeof(trace_proto_t));
+			if ( trace_prot_bind( REST_TRACE_API_MODULE, &tprot )) {
+				LM_DBG("Can't bind <%s>!\n", REST_TRACE_API_MODULE);
+			}
+		}
+	} else {
+		memset( &tprot, 0, sizeof(trace_proto_t));
+	}
 
 	LM_INFO("Module initialized!\n");
-
-	return 0;
-}
-
-static int child_init(int rank)
-{
-	if (rank <= PROC_MAIN)
-		return 0;
-
-	multi_handle = curl_multi_init();
-	if (!multi_handle) {
-		LM_ERR("failed to init CURLM handle\n");
-		return -1;
-	}
 
 	return 0;
 }
@@ -414,9 +472,8 @@ static void set_output_pv_params(struct sip_msg *msg, str *body_in, pv_spec_p bo
 	}
 }
 
-static int w_async_rest_get(struct sip_msg *msg, async_resume_module **resume_f,
-							void **resume_param, char *gp_url,
-							char *body_pv, char *ctype_pv, char *code_pv)
+static int w_async_rest_get(struct sip_msg *msg, async_ctx *ctx,
+					char *gp_url, char *body_pv, char *ctype_pv, char *code_pv)
 {
 	rest_async_param *param;
 	str url;
@@ -437,12 +494,12 @@ static int w_async_rest_get(struct sip_msg *msg, async_resume_module **resume_f,
 	memset(param, '\0', sizeof *param);
 
 	read_fd = start_async_http_req(msg, REST_CLIENT_GET, url.s, NULL, NULL,
-				&param->handle, &param->body, ctype_pv ? &param->ctype : NULL);
+				param, &param->body, ctype_pv ? &param->ctype : NULL);
 
 	/* error occurred; no transfer done */
 	if (read_fd == ASYNC_NO_IO) {
-		*resume_param = NULL;
-		*resume_f = NULL;
+		ctx->resume_param = NULL;
+		ctx->resume_f = NULL;
 		/* keep default async status of NO_IO */
 		return -1;
 
@@ -458,24 +515,25 @@ static int w_async_rest_get(struct sip_msg *msg, async_resume_module **resume_f,
 		curl_easy_cleanup(param->handle);
 		pkg_free(param);
 
-		return ASYNC_SYNC;
+		async_status = ASYNC_SYNC;
+		return 1;
 	}
 
-	*resume_f = resume_async_http_req;
+	ctx->resume_f = resume_async_http_req;
 
 	param->method = REST_CLIENT_GET;
 	param->body_pv = (pv_spec_p)body_pv;
 	param->ctype_pv = (pv_spec_p)ctype_pv;
 	param->code_pv = (pv_spec_p)code_pv;
-	*resume_param = param;
+	ctx->resume_param = param;
 	/* async started with success */
 	async_status = read_fd;
 
 	return 1;
 }
 
-static int w_async_rest_post(struct sip_msg *msg, async_resume_module **resume_f,
-					 void **resume_param, char *gp_url, char *gp_body,
+static int w_async_rest_post(struct sip_msg *msg, async_ctx *ctx,
+					 char *gp_url, char *gp_body,
 					 char *gp_ctype, char *body_pv, char *ctype_pv, char *code_pv)
 {
 	rest_async_param *param;
@@ -507,12 +565,12 @@ static int w_async_rest_post(struct sip_msg *msg, async_resume_module **resume_f
 	memset(param, '\0', sizeof *param);
 
 	read_fd = start_async_http_req(msg, REST_CLIENT_POST, url.s, body.s, ctype.s,
-				&param->handle, &param->body, ctype_pv ? &param->ctype : NULL);
+				param, &param->body, ctype_pv ? &param->ctype : NULL);
 
 	/* error occurred; no transfer done */
 	if (read_fd == ASYNC_NO_IO) {
-		*resume_param = NULL;
-		*resume_f = NULL;
+		ctx->resume_param = NULL;
+		ctx->resume_f = NULL;
 		/* keep default async status of NO_IO */
 		return -1;
 
@@ -528,25 +586,26 @@ static int w_async_rest_post(struct sip_msg *msg, async_resume_module **resume_f
 		curl_easy_cleanup(param->handle);
 		pkg_free(param);
 
-		return ASYNC_SYNC;
+		async_status = ASYNC_SYNC;
+		return 1;
 	}
 
-	*resume_f = resume_async_http_req;
+	ctx->resume_f = resume_async_http_req;
 
 	param->method = REST_CLIENT_POST;
 	param->body_pv = (pv_spec_p)body_pv;
 	param->ctype_pv = (pv_spec_p)ctype_pv;
 	param->code_pv = (pv_spec_p)code_pv;
-	*resume_param = param;
+	ctx->resume_param = param;
 	/* async started with success */
 	async_status = read_fd;
 
 	return 1;
 }
 
-static int w_async_rest_put(struct sip_msg *msg, async_resume_module **resume_f,
-                            void **resume_param, char *gp_url, char *gp_body,
-                            char *gp_ctype, char *body_pv, char *ctype_pv, char *code_pv)
+static int w_async_rest_put(struct sip_msg *msg, async_ctx *ctx,
+							char *gp_url, char *gp_body, char *gp_ctype,
+							char *body_pv, char *ctype_pv, char *code_pv)
 {
 	rest_async_param *param;
 	str url, body, ctype = { NULL, 0 };
@@ -567,7 +626,8 @@ static int w_async_rest_put(struct sip_msg *msg, async_resume_module **resume_f,
 		return -1;
 	}
 
-	LM_DBG("async rest put '%.*s' %p %p %p\n", url.len, url.s, body_pv, ctype_pv, code_pv);
+	LM_DBG("async rest put '%.*s' %p %p %p\n",
+		url.len, url.s, body_pv, ctype_pv, code_pv);
 
 	param = pkg_malloc(sizeof *param);
 	if (!param) {
@@ -577,12 +637,12 @@ static int w_async_rest_put(struct sip_msg *msg, async_resume_module **resume_f,
 	memset(param, '\0', sizeof *param);
 
 	read_fd = start_async_http_req(msg, REST_CLIENT_PUT, url.s, body.s, ctype.s,
-	            &param->handle, &param->body, ctype_pv ? &param->ctype : NULL);
+	            param, &param->body, ctype_pv ? &param->ctype : NULL);
 
 	/* error occurred; no transfer done */
 	if (read_fd == ASYNC_NO_IO) {
-		*resume_param = NULL;
-		*resume_f = NULL;
+		ctx->resume_param = NULL;
+		ctx->resume_f = NULL;
 		/* keep default async status of NO_IO */
 		return -1;
 
@@ -598,16 +658,17 @@ static int w_async_rest_put(struct sip_msg *msg, async_resume_module **resume_f,
 		curl_easy_cleanup(param->handle);
 		pkg_free(param);
 
-		return ASYNC_SYNC;
+		async_status = ASYNC_SYNC;
+		return 1;
 	}
 
-	*resume_f = resume_async_http_req;
+	ctx->resume_f = resume_async_http_req;
 
 	param->method = REST_CLIENT_PUT;
 	param->body_pv = (pv_spec_p)body_pv;
 	param->ctype_pv = (pv_spec_p)ctype_pv;
 	param->code_pv = (pv_spec_p)code_pv;
-	*resume_param = param;
+	ctx->resume_param = param;
 	/* async started with success */
 	async_status = read_fd;
 

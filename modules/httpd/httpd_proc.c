@@ -54,6 +54,7 @@ extern str ip;
 extern str buffer;
 extern int post_buf_size;
 extern struct httpd_cb *httpd_cb_list;
+static union sockaddr_union httpd_server_info;
 
 static const str MI_HTTP_U_URL = str_init("<html><body>"
 "Unable to parse URL!</body></html>");
@@ -387,6 +388,11 @@ void httpd_lookup_arg(void *connection, const char *key,
 	return;
 }
 
+union sockaddr_union* httpd_get_server_info(void)
+{
+	return &httpd_server_info;
+}
+
 
 int answer_to_connection (void *cls, struct MHD_Connection *connection,
 		const char *url, const char *method,
@@ -406,6 +412,12 @@ int answer_to_connection (void *cls, struct MHD_Connection *connection,
 	int accept_type = HTTPD_STD_CNT_TYPE;
 	int ret_code = MHD_HTTP_OK;
 
+#if ( MHD_VERSION >= 0x000092800 )
+	int sv_sockfd;
+	socklen_t addrlen=sizeof(httpd_server_info);
+#endif
+	union sockaddr_union* cl_socket;
+
 	LM_DBG("START *** cls=%p, connection=%p, url=%s, method=%s, "
 			"versio=%s, upload_data[%zu]=%p, *con_cls=%p\n",
 			cls, connection, url, method, version,
@@ -422,6 +434,23 @@ int answer_to_connection (void *cls, struct MHD_Connection *connection,
 		*con_cls = pr;
 		pr = NULL;
 	}
+
+	/* we're safe here since this returns a struct sockaddr* and
+	 * sockaddr_union contains sockaddr* inside */
+	cl_socket = (union sockaddr_union *)MHD_get_connection_info(connection,
+			MHD_CONNECTION_INFO_CLIENT_ADDRESS)->client_addr;
+
+#if ( MHD_VERSION >= 0x000092800 )
+	sv_sockfd = MHD_get_connection_info(connection, MHD_CONNECTION_INFO_CONNECTION_FD)->connect_fd;
+	getsockname( sv_sockfd, &httpd_server_info.s, &addrlen);
+
+	/* we could do
+	 * httpd_server_info.sin.sin_port = ntohs(httpd_server_info.sin.sin_port);
+	 * but it has no sense since we already know the port since we initialised
+	 * httpd server
+	 */
+	httpd_server_info.sin.sin_port = port;
+#endif
 
 	if(strncmp(method, "POST", 4)==0) {
 		if(pr == NULL){
@@ -503,7 +532,7 @@ int answer_to_connection (void *cls, struct MHD_Connection *connection,
 								normalised_url,
 								method, version,
 								upload_data, upload_data_size, con_cls,
-								&buffer, &page);
+								&buffer, &page, cl_socket);
 					} else {
 						page = MI_HTTP_U_URL;
 						ret_code = MHD_HTTP_BAD_REQUEST;
@@ -589,7 +618,7 @@ int answer_to_connection (void *cls, struct MHD_Connection *connection,
 						normalised_url,
 						method, version,
 						upload_data, upload_data_size, con_cls,
-						&buffer, &page);
+						&buffer, &page, cl_socket);
 			} else {
 				page = MI_HTTP_U_URL;
 				ret_code = MHD_HTTP_BAD_REQUEST;
@@ -613,7 +642,7 @@ int answer_to_connection (void *cls, struct MHD_Connection *connection,
 					normalised_url,
 					method, version,
 					upload_data, upload_data_size, con_cls,
-					&buffer, &page);
+					&buffer, &page, cl_socket);
 		} else {
 			page = MI_HTTP_U_URL;
 			ret_code = MHD_HTTP_BAD_REQUEST;
@@ -707,6 +736,13 @@ void httpd_proc(int rank)
 		saddr_in.sin_addr.s_addr = INADDR_ANY;
 	saddr_in.sin_family = AF_INET;
 	saddr_in.sin_port = htons(port);
+
+
+#if ( MHD_VERSION < 0x000092800 )
+	memcpy( &httpd_server_info, &saddr_in, sizeof(struct sockaddr_in) );
+	httpd_server_info.sin.sin_port = port;
+#endif
+
 
 	LM_DBG("init_child [%d] - [%d] HTTP Server init [%s:%d]\n",
 		rank, getpid(), (ip.s?ip.s:"INADDR_ANY"), port);
