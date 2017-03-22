@@ -323,4 +323,64 @@ modparam("proto_hep", "tcp_async_local_write_timeout", 100)
 
 	</section>
 
+	<section>
+	<title>Exported Functions</title>
+	<section>
+		<title>
+		<function moreinfo="none">correlate(hep_id, type1, correlation1, type2, correlation2)</function>
+		</title>
+		<para>
+			Send a hep message with an extra correlation id containing the two correlation given
+			as arguments. The two types must differ. All parameters are mandatory. This will help
+			on the capturing side to correlate two calls for example, being given their callid
+			as correlation ids.
+		</para>
+		<para>
+		This function can be used from REQUEST_ROUTE, FAILURE_ROUTE, ONREPLY_ROUTE, BRANCH_ROUTE, LOCAL_ROUTE.
+		</para>
+		<para>Meaning of the parameters is as follows:</para>
+		<itemizedlist>
+		<listitem>
+			<para><emphasis>hep_id (string, pvar)</emphasis>
+				the name of the <emphasis>hep_id</emphasis> defined in modparam section,
+				specifying where to do the tracing.
+			</para>
+		</listitem>
+		<listitem>
+			<para><emphasis>type1 (string)</emphasis>
+				the key name identify the first correlation id.
+			</para>
+		</listitem>
+		<listitem>
+			<para><emphasis>correlation1 (string, pvar)</emphasis>
+				the first extra correlation id that will be put in the extra correlation chunk.
+			</para>
+		</listitem>
+		<listitem>
+			<para><emphasis>type2 (string)</emphasis>
+				the key name identify the second correlation id.
+			</para>
+		</listitem>
+		<listitem>
+			<para><emphasis>correlation2 (string, pvar)</emphasis>
+				the second extra correlation id that will be put in the extra correlation chunk.
+			</para>
+		</listitem>
+
+		</itemizedlist>
+		<example>
+		<title><function>correlate</function> usage</title>
+		<programlisting format="linespecific">
+...
+/* see declaration of hep_dst in trace_id section */
+/* we suppose we have two correlations in two varibles: cor1 and cor2 */
+	correlate("hep_dst", "correlation-no-1","$var(cor1)","correlation-no-2", "$var(cor2)");
+...
+</programlisting>
+		</example>
+	</section>
+	</section>
+
+
+
 </chapter>

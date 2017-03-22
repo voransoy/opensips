@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "../../net/net_tcp.h"
 #include "../../sr_module.h"
 #include "../../dprint.h"
 #include "../../ut.h"
@@ -141,9 +142,7 @@ static void trace_slack_in(struct sip_msg* req, str *buffer,int rpl_code,
 static struct mi_root* sip_trace_mi(struct mi_root* cmd, void* param );
 
 static int trace_send_duplicate(char *buf, int len, struct sip_uri *uri);
-static int send_trace_proto_duplicate(str *body, str *fromproto, str *fromip,
-		unsigned short fromport, str *toproto, str *toip,
-		unsigned short toport, trace_dest dest, str* correlation);
+static int send_trace_proto_duplicate( trace_dest dest, str* correlation, trace_info_p info);
 
 
 
@@ -943,7 +942,6 @@ static int save_siptrace(struct sip_msg *msg, db_key_t *keys, db_val_t *vals,
 
 	/* makes sense only if trace protocol loaded */
 	if ( tprot.send_message && !is_id_traced(sip_trace_id)) {
-		LM_DBG("sip messages tracing not enabled!\n");
 		return 1;
 	}
 
@@ -955,11 +953,7 @@ static int save_siptrace(struct sip_msg *msg, db_key_t *keys, db_val_t *vals,
 
 		switch (it->type) {
 		case TYPE_HEP:
-			if (send_trace_proto_duplicate(&db_vals[0].val.blob_val,
-					&db_vals[4].val.str_val, &db_vals[5].val.str_val,
-					db_vals[6].val.int_val, &db_vals[7].val.str_val,
-					&db_vals[8].val.str_val, db_vals[9].val.int_val,
-					it->el.hep.hep_id, &msg->callid->body) < 0) {
+			if (send_trace_proto_duplicate( it->el.hep.hep_id, &msg->callid->body, info) < 0) {
 				LM_ERR("Failed to duplicate with hep to <%.*s:%u>\n",
 						it->el.hep.hep_id->ip.len, it->el.hep.hep_id->ip.s,
 						it->el.hep.hep_id->port_no);
@@ -999,16 +993,18 @@ static int save_siptrace(struct sip_msg *msg, db_key_t *keys, db_val_t *vals,
 static void trace_transaction_dlgcb(struct dlg_cell* dlg, int type,
 		struct dlg_cb_params * params)
 {
-	trace_info_p info;
+	trace_info_t info;
 
-	info=*params->param;
 
-	if (trace_transaction(params->msg, info, 1)<0) {
+
+	if (trace_transaction(params->msg, (trace_info_p)*params->param, 1)<0) {
 		LM_ERR("trace transaction failed!\n");
 		return;
 	}
 
-	sip_trace(params->msg, info);
+	info= *(trace_info_p)(*params->param);
+	info.conn_id = params->msg->rcv.proto_reserved1;
+	sip_trace(params->msg, &info);
 }
 
 void free_trace_info_pkg(void *param)
@@ -1116,12 +1112,26 @@ static int trace_dialog(struct sip_msg *msg, trace_info_p info)
 static void siptrace_dlg_cancel(struct cell* t, int type, struct tmcb_params *param)
 {
 	struct sip_msg *req;
+	trace_info_t info;
+
 	req = param->req;
 
 	LM_DBG("Tracing incoming cancel due to trace_dialog() \n");
 
+	if (trace_transaction(req, *param->param, 1) < 0) {
+		LM_ERR("trace transaction failed!\n");
+		return;
+	}
+
+	info = *(trace_info_p)(*param->param);
+	if ( req->rcv.proto != PROTO_UDP ) {
+		info.conn_id = req->rcv.proto_reserved1;
+	} else {
+		info.conn_id = 0;
+	}
+
 	/* trace current request */
-	sip_trace(req, (trace_info_p)(*param->param));
+	sip_trace(req, &info);
 }
 
 
@@ -1592,6 +1602,15 @@ static int sip_trace_w(struct sip_msg *msg, char *param1,
 		}
 	}
 
+
+	/* we're safe; nobody will be in conflict with this conn id since evrybody else
+	 * will have a local copy of this structure */
+	if ( msg->rcv.proto != PROTO_UDP ) {
+		info->conn_id = msg->rcv.proto_reserved1;
+	} else {
+		info->conn_id = 0;
+	}
+
 	if (sip_trace(msg, info) < 0) {
 		LM_ERR("sip trace failed!\n");
 		return -1;
@@ -1643,7 +1662,6 @@ static int sip_trace(struct sip_msg *msg, trace_info_p info)
 		LM_ERR("cannot parse call-id\n");
 		goto error;
 	}
-
 
 	LM_DBG("sip_trace called \n");
 	db_vals[0].val.blob_val.s = msg->buf;
@@ -1702,6 +1720,8 @@ error:
 
 static void trace_onreq_out(struct cell* t, int type, struct tmcb_params *ps)
 {
+	trace_info_t info;
+	struct dest_info* dest;
 
 	if(t==NULL || ps==NULL) {
 		LM_DBG("no uas request, local transaction\n");
@@ -1714,16 +1734,28 @@ static void trace_onreq_out(struct cell* t, int type, struct tmcb_params *ps)
 	}
 
 	LM_DBG("trace on req out \n");
+	/* we do this little trick in order to have the info on the stack, not
+	 * shared to avoid conflicts on conn_id field */
+	info = *(trace_info_p)(*ps->param);
+	dest = ps->extra2;
 
-	if (ps->extra2)
+	if (dest) {
+		if ( dest->proto != PROTO_UDP ) {
+			info.conn_id = last_outgoing_tcp_id;
+		} else {
+			info.conn_id = 0;
+		}
+
 		trace_msg_out( ps->req, (str*)ps->extra1,
-			((struct dest_info*)ps->extra2)->send_sock,
-			((struct dest_info*)ps->extra2)->proto,
-			&((struct dest_info*)ps->extra2)->to,
-			(trace_info_p)(*ps->param));
-	else
+			dest->send_sock,
+			dest->proto,
+			&dest->to,
+			&info);
+	} else {
+		info.conn_id = 0;
 		trace_msg_out( ps->req, (str*)ps->extra1,
-			NULL, PROTO_NONE, NULL, (trace_info_p)(*ps->param));
+			NULL, PROTO_NONE, NULL, &info);
+	}
 
 }
 
@@ -1944,14 +1976,16 @@ static void trace_onreply_in(struct cell* t, int type, struct tmcb_params *ps)
 	char statusbuf[INT2STR_MAX_LEN];
 	int len;
 
-	/* context for replies */
-	SET_SIPTRACE_CONTEXT((trace_info_p)(*ps->param));
+	trace_info_t info;
 
 	if(t==NULL || t->uas.request==0 || ps==NULL)
 	{
 		LM_DBG("no uas request, local transaction\n");
 		return;
 	}
+
+	/* context for replies */
+	SET_SIPTRACE_CONTEXT((trace_info_p)(*ps->param));
 
 	req = ps->req;
 	msg = ps->rpl;
@@ -1960,6 +1994,16 @@ static void trace_onreply_in(struct cell* t, int type, struct tmcb_params *ps)
 	{
 		LM_DBG("no reply\n");
 		return;
+	}
+
+
+	/* we do this little trick in order to have the info on the stack, not
+	 * shared to avoid conflicts on conn_id field */
+	info = *(trace_info_p)(*ps->param);
+	if ( msg->rcv.proto != PROTO_UDP ) {
+		info.conn_id = msg->rcv.proto_reserved1;
+	} else {
+		info.conn_id = 0;
 	}
 
 	LM_DBG("trace onreply in \n");
@@ -2021,7 +2065,7 @@ static void trace_onreply_in(struct cell* t, int type, struct tmcb_params *ps)
 	db_vals[12].val.str_val.s = get_from(msg)->tag_value.s;
 	db_vals[12].val.str_val.len = get_from(msg)->tag_value.len;
 
-	if (save_siptrace(msg, db_keys,db_vals, (trace_info_p)(*ps->param)) < 0) {
+	if (save_siptrace(msg, db_keys,db_vals, &info) < 0) {
 		LM_ERR("failed to save siptrace\n");
 		goto error;
 	}
@@ -2045,6 +2089,8 @@ static void trace_onreply_out(struct cell* t, int type, struct tmcb_params *ps)
 	char statusbuf[8];
 	str *sbuf;
 	struct dest_info *dst;
+
+	trace_info_t info;
 
 	if (t==NULL || t->uas.request==0 || ps==NULL)
 	{
@@ -2121,6 +2167,18 @@ static void trace_onreply_out(struct cell* t, int type, struct tmcb_params *ps)
 	db_vals[3].val.str_val.len = len;
 
 	dst = (struct dest_info*)ps->extra2;
+	/* we do this little trick in order to have the info on the stack, not
+	 * shared to avoid conflicts on conn_id field */
+	info = *(trace_info_p)(*ps->param);
+	if ( dst == NULL ) {
+		info.conn_id = 0;
+	} else {
+		if ( dst->proto != PROTO_UDP ) {
+			info.conn_id = dst->proto_reserved1;
+		} else {
+			info.conn_id = 0;
+		}
+	}
 
 	if (trace_local_ip.s && trace_local_ip.len > 0){
 		set_columns_to_trace_local_ip( db_vals[4], db_vals[5], db_vals[6]);
@@ -2156,7 +2214,7 @@ static void trace_onreply_out(struct cell* t, int type, struct tmcb_params *ps)
 	db_vals[12].val.str_val.s = get_from(msg)->tag_value.s;
 	db_vals[12].val.str_val.len = get_from(msg)->tag_value.len;
 
-	if (save_siptrace(msg, db_keys,db_vals, (trace_info_p)(*ps->param)) < 0) {
+	if (save_siptrace(msg, db_keys,db_vals, &info) < 0) {
 		LM_ERR("failed to save siptrace\n");
 		goto error;
 	}
@@ -2380,15 +2438,30 @@ static int trace_send_duplicate(char *buf, int len, struct sip_uri *uri)
 }
 
 
-static int send_trace_proto_duplicate(str *body, str *fromproto, str *fromip,
-		unsigned short fromport, str *toproto, str *toip,
-		unsigned short toport, trace_dest dest, str* correlation)
+static int send_trace_proto_duplicate( trace_dest dest, str* correlation, trace_info_p info)
 {
 	union sockaddr_union from_su;
 	union sockaddr_union to_su;
 	unsigned int proto;
+	str *body, *fromproto, *fromip;
+	str *toproto, *toip;
+	unsigned short fromport, toport;
+
+	unsigned long long trans_correlation_id;
+	str conn_id_s;
 
 	trace_message trace_msg;
+
+	/* WARNING - db_vals has to be set by functions above */
+	body = &db_vals[0].val.blob_val;
+
+	fromproto = &db_vals[4].val.str_val;
+	fromip = &db_vals[5].val.str_val;
+	fromport = db_vals[6].val.int_val;
+
+	toproto = &db_vals[7].val.str_val;
+	toip = &db_vals[8].val.str_val;
+	toport = db_vals[9].val.int_val;
 
 	if(body->s==NULL || body->len <= 0)
 		return -1;
@@ -2412,18 +2485,26 @@ static int send_trace_proto_duplicate(str *body, str *fromproto, str *fromip,
 
 	tprot.add_payload_part( trace_msg, "payload", body);
 
+	if ( info->conn_id != 0 ) {
+		tcp_get_correlation_id( info->conn_id, &trans_correlation_id);
+
+
+		conn_id_s.s =  int2str( trans_correlation_id, &conn_id_s.len);
+		tprot.add_extra_correlation( trace_msg, "trans", &conn_id_s);
+	}
+
 	if (correlation) {
 		if ( corr_id == -1 && corr_vendor == -1 ) {
 			if (tprot.get_data_id(corr_id_s, &corr_vendor, &corr_id) == 0) {
 				LM_DBG("no data id!\n");
 			}
-		} else {
-			if (tprot.add_chunk(trace_msg,
-					correlation->s, correlation->len,
-						TRACE_TYPE_STR, corr_id, corr_vendor)) {
-				LM_ERR("failed to add correlation id to the packet!\n");
-				return -1;
-			}
+		}
+
+		if (tprot.add_chunk(trace_msg,
+				correlation->s, correlation->len,
+					TRACE_TYPE_STR, corr_id, corr_vendor)) {
+			LM_ERR("failed to add correlation id to the packet!\n");
+			return -1;
 		}
 	}
 

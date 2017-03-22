@@ -1,4 +1,4 @@
-/* 
+/*
  * File:   tls_helper.h
  * Author: cristi
  *
@@ -8,8 +8,9 @@
 #ifndef TLS_HELPER_H
 #define TLS_HELPER_H
 
-#define F_TLS_DO_ACCEPT  (1<<0)
-#define F_TLS_DO_CONNECT (1<<1)
+#define F_TLS_DO_ACCEPT   (1<<0)
+#define F_TLS_DO_CONNECT  (1<<1)
+#define F_TLS_TRACE_READY (1<<2)
 
 #include "tls_config_helper.h"
 #include "../../locking.h"
@@ -23,11 +24,11 @@ struct tls_domain {
 	int             verify_cert;
 	int             require_client_cert;
 	int             crl_check_all;
-	char           *cert_file;
-	char           *pkey_file;
+	str            cert;
+	str            pkey;
 	char           *crl_directory;
-	char           *ca_file;
-	char           *tmp_dh_file;
+	str            ca;
+	str            dh_param;
 	char           *tls_ec_curve;
 	char           *ca_directory;
 	char           *ciphers_list;

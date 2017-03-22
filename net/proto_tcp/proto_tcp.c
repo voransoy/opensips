@@ -34,10 +34,18 @@
 #include "../../net/api_proto.h"
 #include "../../net/api_proto_net.h"
 #include "../../net/net_tcp.h"
+#include "../../net/net_tcp_report.h"
+#include "../../net/trans_trace.h"
 #include "../../socket_info.h"
 #include "../../tsend.h"
+#include "../../trace_api.h"
+
 #include "tcp_common_defs.h"
 #include "proto_tcp_handler.h"
+
+#define F_TCP_CONN_TRACED ( 1 << 0 )
+#define TRACE_ON(flags) (t_dst && (*trace_is_on) && \
+						!(flags & F_CONN_TRACE_DROPPED))
 
 static int mod_init(void);
 static int proto_tcp_init(struct proto_info *pi);
@@ -61,7 +69,23 @@ static int tcp_write_async_req(struct tcp_connection* con,int fd);
 static int tcp_read_req(struct tcp_connection* con, int* bytes_read);
 static int tcp_conn_init(struct tcp_connection* c);
 static void tcp_conn_clean(struct tcp_connection* c);
+static void tcp_report(int type, unsigned long long conn_id, int conn_flags,
+		void *extra);
+static struct mi_root* tcp_trace_mi(struct mi_root* cmd, void* param );
 
+#define TRACE_PROTO "proto_hep"
+
+static str trace_destination_name = {NULL, 0};
+trace_dest t_dst;
+trace_proto_t tprot;
+
+/* module  tracing parameters */
+static int trace_is_on_tmp=1, *trace_is_on;
+static char* trace_filter_route;
+static int trace_filter_route_id = -1;
+/**/
+
+extern int unix_tcp_sock;
 
 /* default port for TCP protocol */
 static int tcp_port = SIP_PORT;
@@ -80,7 +104,7 @@ static int tcp_async_local_connect_timeout = 100;
  * write - if write op exceeds this, it will get passed to TCP main*/
 static int tcp_async_local_write_timeout = 10;
 
-/* maximum number of write chunks that will be queued per TCP connection - 
+/* maximum number of write chunks that will be queued per TCP connection -
   if we exceed this number, we just drop the connection */
 static int tcp_async_max_postponed_chunks = 32;
 
@@ -132,21 +156,39 @@ static param_export_t params[] = {
 											&tcp_async_local_connect_timeout},
 	{ "tcp_async_local_write_timeout",   INT_PARAM,
 											&tcp_async_local_write_timeout  },
+	{ "trace_destination",               STR_PARAM, &trace_destination_name.s},
+	{ "trace_on",						 INT_PARAM, &trace_is_on_tmp        },
+	{ "trace_filter_route",				 STR_PARAM, &trace_filter_route     },
 	{0, 0, 0}
 };
 
+static mi_export_t mi_cmds[] = {
+	{ "tcp_trace", 0, tcp_trace_mi,   0,  0,  0 },
+	{ 0, 0, 0, 0, 0, 0}
+};
+
+/* module dependencies */
+static dep_export_t deps = {
+	{ /* OpenSIPS module dependencies */
+		{ MOD_TYPE_DEFAULT, "proto_hep", DEP_SILENT },
+		{ MOD_TYPE_NULL, NULL, 0 }
+	},
+	{ /* modparam dependencies */
+		{ NULL, NULL}
+	}
+};
 
 struct module_exports proto_tcp_exports = {
 	PROTO_PREFIX "tcp",  /* module name*/
 	MOD_TYPE_DEFAULT,/* class of this module */
 	MODULE_VERSION,
 	DEFAULT_DLFLAGS, /* dlopen flags */
-	NULL,            /* OpenSIPS module dependencies */
+	&deps,            /* OpenSIPS module dependencies */
 	cmds,       /* exported functions */
 	0,          /* exported async functions */
 	params,     /* module parameters */
 	0,          /* exported statistics */
-	0,          /* exported MI functions */
+	mi_cmds,          /* exported MI functions */
 	0,          /* exported pseudo-variables */
 	0,          /* extra processes */
 	mod_init,   /* module initialization function */
@@ -168,6 +210,7 @@ static int proto_tcp_init(struct proto_info *pi)
 	pi->net.flags			= PROTO_NET_USE_TCP;
 	pi->net.read			= (proto_net_read_f)tcp_read_req;
 	pi->net.write			= (proto_net_write_f)tcp_write_async_req;
+	pi->net.report			= tcp_report;
 
 	if (tcp_async && !tcp_has_async_write()) {
 		LM_WARN("TCP network layer does not have support for ASYNC write, "
@@ -188,6 +231,37 @@ static int proto_tcp_init(struct proto_info *pi)
 static int mod_init(void)
 {
 	LM_INFO("initializing TCP-plain protocol\n");
+	if (trace_destination_name.s) {
+		if ( !net_trace_api ) {
+			if ( trace_prot_bind( TRACE_PROTO, &tprot) < 0 ) {
+				LM_ERR( "can't bind trace protocol <%s>\n", TRACE_PROTO );
+				return -1;
+			}
+
+			net_trace_api = &tprot;
+		} else {
+			tprot = *net_trace_api;
+		}
+
+		trace_destination_name.len = strlen( trace_destination_name.s );
+
+		if ( net_trace_proto_id == -1 )
+			net_trace_proto_id = tprot.get_message_id( TRANS_TRACE_PROTO_ID );
+
+		t_dst = tprot.get_trace_dest_by_name( &trace_destination_name );
+	}
+
+	/* fix route name */
+	if ( !(trace_is_on = shm_malloc(sizeof(int))) ) {
+		LM_ERR("no more shared memory!\n");
+		return -1;
+	}
+
+	*trace_is_on = trace_is_on_tmp;
+	if ( trace_filter_route ) {
+		trace_filter_route_id =
+			get_script_route_ID_by_name( trace_filter_route, rlist, RT_NO);
+	}
 
 	return 0;
 }
@@ -218,6 +292,7 @@ static int tcp_conn_init(struct tcp_connection* c)
 	d->oldest_chunk = 0;
 
 	c->proto_data = (void*)d;
+
 	return 0;
 }
 
@@ -279,6 +354,27 @@ again:
 	return bytes_read;
 }
 
+
+static void tcp_report(int type, unsigned long long conn_id, int conn_flags,
+																void *extra)
+{
+	str s;
+
+	if (type==TCP_REPORT_CLOSE) {
+		/* grab reason text */
+		if (extra) {
+			s.s = (char*)extra;
+			s.len = strlen (s.s);
+		}
+
+		if ( TRACE_ON( conn_flags ) ) {
+			trace_message_atonce( PROTO_TCP, conn_id, NULL/*src*/, NULL/*dst*/,
+				TRANS_TRACE_CLOSED, TRANS_TRACE_SUCCESS, extra?&s:NULL, t_dst );
+		}
+	}
+
+	return;
+}
 
 
 /**************  CONNECT related functions ***************/
@@ -644,6 +740,8 @@ static int proto_tcp_send(struct socket_info* send_sock,
 	struct timeval get,snd;
 	int fd, n;
 
+	union sockaddr_union src_su, dst_su;
+
 	port=0;
 
 	reset_tcp_vars(tcpthreshold);
@@ -687,9 +785,30 @@ static int proto_tcp_send(struct socket_info* send_sock,
 				return -1;
 			}
 			/* connect succeeded, we have a connection */
+			LM_DBG( "Succesfully connected from interface %s:%d to %s:%d!\n",
+				ip_addr2a( &c->rcv.src_ip ), c->rcv.src_port,
+				ip_addr2a( &c->rcv.dst_ip ), c->rcv.dst_port );
+
+
+
 			if (n==0) {
+				/* trace the message */
+				if ( TRACE_ON( c->flags ) &&
+						check_trace_route( trace_filter_route_id, c) ) {
+					if ( tcpconn2su( c, &src_su, &dst_su) < 0 ) {
+						LM_ERR("can't create su structures for tracing!\n");
+					} else {
+						trace_message_atonce( PROTO_TCP, c->cid, &src_su, &dst_su,
+							TRANS_TRACE_CONNECT_START, TRANS_TRACE_SUCCESS,
+							&AS_CONNECT_INIT, t_dst );
+					}
+				}
+
+				/* mark the ID of the used connection (tracing purposes) */
+				last_outgoing_tcp_id = c->id;
+
 				/* connect is still in progress, break the sending
-				 * flow now (the actual write will be done when 
+				 * flow now (the actual write will be done when
 				 * connect will be completed */
 				LM_DBG("Successfully started async connection \n");
 				tcp_conn_release(c, 0);
@@ -699,14 +818,56 @@ static int proto_tcp_send(struct socket_info* send_sock,
 			LM_DBG("First connect attempt succeeded in less than %d ms, "
 				"proceed to writing \n",tcp_async_local_connect_timeout);
 			/* our first connect attempt succeeded - go ahead as normal */
-		} else if ((c=tcp_sync_connect(send_sock, to, &fd))==0) {
-			LM_ERR("connect failed\n");
-			get_time_difference(get,tcpthreshold,tcp_timeout_con_get);
-			return -1;
+			/* trace the attempt */
+			if (  TRACE_ON( c->flags ) &&
+					check_trace_route( trace_filter_route_id, c) ) {
+				c->proto_flags |= F_TCP_CONN_TRACED;
+				if ( tcpconn2su( c, &src_su, &dst_su) < 0 ) {
+					LM_ERR("can't create su structures for tracing!\n");
+				} else {
+					trace_message_atonce( PROTO_TCP, c->cid, &src_su, &dst_su,
+						TRANS_TRACE_CONNECTED, TRANS_TRACE_SUCCESS,
+						&ASYNC_CONNECT_OK, t_dst );
+				}
+			}
+		} else {
+			if ((c=tcp_sync_connect(send_sock, to, &fd))==0) {
+				LM_ERR("connect failed\n");
+				get_time_difference(get,tcpthreshold,tcp_timeout_con_get);
+				return -1;
+			}
+
+			if ( TRACE_ON( c->flags ) &&
+					check_trace_route( trace_filter_route_id, c) ) {
+				c->proto_flags |= F_TCP_CONN_TRACED;
+				if ( tcpconn2su( c, &src_su, &dst_su) < 0 ) {
+					LM_ERR("can't create su structures for tracing!\n");
+				} else {
+					trace_message_atonce( PROTO_TCP, c->cid, &src_su, &dst_su,
+						TRANS_TRACE_CONNECTED, TRANS_TRACE_SUCCESS,
+						&CONNECT_OK, t_dst );
+				}
+			}
+
+			LM_DBG( "Succesfully connected from interface %s:%d to %s:%d!\n",
+				ip_addr2a( &c->rcv.src_ip ), c->rcv.src_port,
+				ip_addr2a( &c->rcv.dst_ip ), c->rcv.dst_port );
 		}
-	
+
 		goto send_it;
 	}
+
+	if ( !(c->proto_flags & F_TCP_CONN_TRACED) ) {
+		/* most probably it's an async connect */
+		if ( TRACE_ON( c->flags ) ) {
+			trace_message_atonce( PROTO_TCP, c->cid, 0, 0,
+				TRANS_TRACE_CONNECTED, TRANS_TRACE_SUCCESS,
+				&CONNECT_OK, t_dst );
+		}
+
+		c->proto_flags |= F_TCP_CONN_TRACED;
+	}
+
 	get_time_difference(get,tcpthreshold,tcp_timeout_con_get);
 
 	/* now we have a connection, let's see what we can do with it */
@@ -728,6 +889,9 @@ static int proto_tcp_send(struct socket_info* send_sock,
 				tcp_conn_release(c, 0);
 				return -1;
 			}
+
+			/* mark the ID of the used connection (tracing purposes) */
+			last_outgoing_tcp_id = c->id;
 
 			/* we successfully added our write chunk - success */
 			tcp_conn_release(c, 0);
@@ -767,6 +931,9 @@ send_it:
 	either we just connected, or main sent us the FD */
 	if (c->proc_id != process_no)
 		close(fd);
+
+	/* mark the ID of the used connection (tracing purposes) */
+	last_outgoing_tcp_id = c->id;
 
 	tcp_conn_release(c, (n<len)?1:0/*pending data in async mode?*/ );
 	return n;
@@ -901,6 +1068,27 @@ static int tcp_read_req(struct tcp_connection* con, int* bytes_read)
 	int total_bytes;
 	struct tcp_req* req;
 
+	union sockaddr_union src_su, dst_su;
+
+	if ( !(con->proto_flags & F_TCP_CONN_TRACED)) {
+		con->proto_flags |= F_TCP_CONN_TRACED;
+
+		LM_DBG("Accepted connection from %s:%d on interface %s:%d!\n",
+			ip_addr2a( &con->rcv.src_ip ), con->rcv.src_port,
+			ip_addr2a( &con->rcv.dst_ip ), con->rcv.dst_port );
+
+		if ( TRACE_ON( con->flags ) &&
+					check_trace_route( trace_filter_route_id, con) ) {
+			if ( tcpconn2su( con, &src_su, &dst_su) < 0 ) {
+				LM_ERR("can't create su structures for tracing!\n");
+			} else {
+				trace_message_atonce( PROTO_TCP, con->cid, &src_su, &dst_su,
+					TRANS_TRACE_ACCEPTED, TRANS_TRACE_SUCCESS,
+					&ACCEPT_OK, t_dst );
+			}
+		}
+	}
+
 	bytes=-1;
 	total_bytes=0;
 
@@ -977,5 +1165,45 @@ error:
 }
 
 
+static struct mi_root* tcp_trace_mi(struct mi_root* cmd_tree, void* param )
+{
+	struct mi_node* node;
 
+	struct mi_node *rpl;
+	struct mi_root *rpl_tree ;
 
+	node = cmd_tree->node.kids;
+	if(node == NULL) {
+		/* display status on or off */
+		rpl_tree = init_mi_tree( 200, MI_SSTR(MI_OK));
+		if (rpl_tree == 0)
+			return 0;
+		rpl = &rpl_tree->node;
+
+		if ( *trace_is_on ) {
+			node = add_mi_node_child(rpl,0,MI_SSTR("TCP tracing"),MI_SSTR("on"));
+		} else {
+			node = add_mi_node_child(rpl,0,MI_SSTR("TCP tracing"),MI_SSTR("off"));
+		}
+
+		return rpl_tree ;
+	} else if ( node && !node->next ) {
+		if ( (node->value.s[0] | 0x20) == 'o' &&
+				(node->value.s[1] | 0x20) == 'n' ) {
+			*trace_is_on = 1;
+			return init_mi_tree( 200, MI_SSTR(MI_OK));
+		} else
+		if ( (node->value.s[0] | 0x20) == 'o' &&
+				(node->value.s[1] | 0x20) == 'f' &&
+				(node->value.s[2] | 0x20) == 'f' ) {
+			*trace_is_on = 0;
+			return init_mi_tree( 200, MI_SSTR(MI_OK));
+		} else {
+			return init_mi_tree( 500, MI_SSTR(MI_INTERNAL_ERR));
+		}
+	} else {
+		return init_mi_tree( 500, MI_SSTR(MI_INTERNAL_ERR));
+	}
+
+	return NULL;
+}

@@ -101,19 +101,15 @@ void tls_release_domain(struct tls_domain* dom)
 	lock_stop_write(dom_lock);
 }
 
-int set_all_domain_attr(struct tls_domain **dom, char **str_vals, int *int_vals)
+int set_all_domain_attr(struct tls_domain **dom, char **str_vals, int *int_vals, str* blob_vals)
 {
 	size_t len;
 	char *p;
 	struct tls_domain *d = *dom;
 	size_t cadir_len = strlen(str_vals[STR_VALS_CADIR_COL]);
-	size_t calist_len = strlen(str_vals[STR_VALS_CALIST_COL]);
-	size_t certificate_len = strlen(str_vals[STR_VALS_CERTIFICATE_COL]);
 	size_t cplist_len = strlen(str_vals[STR_VALS_CPLIST_COL]);
 	size_t crl_dir_len = strlen(str_vals[STR_VALS_CRL_DIR_COL]);
-	size_t dhparams_len = strlen(str_vals[STR_VALS_DHPARAMS_COL]);
 	size_t eccurve_len = strlen(str_vals[STR_VALS_ECCURVE_COL]);
-	size_t pk_len = strlen(str_vals[STR_VALS_PK_COL]);
 
 
 	len = sizeof(struct tls_domain) +d->id.len;
@@ -121,28 +117,26 @@ int set_all_domain_attr(struct tls_domain **dom, char **str_vals, int *int_vals)
 	if (cadir_len)
 		len += cadir_len + 1;
 
-	if (calist_len)
-		len += calist_len + 1;
-
-
-	if (certificate_len)
-		len += certificate_len + 1;
-
 	if (cplist_len)
 		len += cplist_len + 1;
 
 	if (crl_dir_len)
 		len += crl_dir_len + 1;
 
-	if (dhparams_len)
-		len += dhparams_len + 1;
-
 	if (eccurve_len)
 		len += eccurve_len + 1;
 
-	if (pk_len)
-		len += pk_len + 1;
+	if(blob_vals[BLOB_VALS_CERTIFICATE_COL].len && blob_vals[BLOB_VALS_CERTIFICATE_COL].s)
+		len += blob_vals[BLOB_VALS_CERTIFICATE_COL].len;
 
+	if(blob_vals[BLOB_VALS_PK_COL].len && blob_vals[BLOB_VALS_PK_COL].s)
+		len += blob_vals[BLOB_VALS_PK_COL].len;
+
+	if(blob_vals[BLOB_VALS_CALIST_COL].len && blob_vals[BLOB_VALS_CALIST_COL].s)
+		len += blob_vals[BLOB_VALS_CALIST_COL].len;
+
+	if(blob_vals[BLOB_VALS_DHPARAMS_COL].len && blob_vals[BLOB_VALS_DHPARAMS_COL].s)
+		len += blob_vals[BLOB_VALS_DHPARAMS_COL].len;
 
 	d = shm_realloc(d, len);
 	if (d == NULL) {
@@ -185,17 +179,20 @@ int set_all_domain_attr(struct tls_domain **dom, char **str_vals, int *int_vals)
 		p = p + cadir_len + 1;
 	}
 
-	if (calist_len) {
-		d->ca_file = p;
-		memcpy(p, str_vals[STR_VALS_CALIST_COL], calist_len);
-		p = p + calist_len + 1;
+	if (blob_vals[BLOB_VALS_CALIST_COL].len && blob_vals[BLOB_VALS_CALIST_COL].s) {
+		d->ca.s = p;
+		d->ca.len = blob_vals[BLOB_VALS_CALIST_COL].len;
+		memcpy(p, blob_vals[BLOB_VALS_CALIST_COL].s, blob_vals[BLOB_VALS_CALIST_COL].len);
+		p = p + d->ca.len;
 	}
 
-	if (certificate_len) {
-		d->cert_file = p;
-		memcpy(p, str_vals[STR_VALS_CERTIFICATE_COL], certificate_len);
-		p = p + certificate_len + 1;
+	if (blob_vals[BLOB_VALS_CERTIFICATE_COL].len && blob_vals[BLOB_VALS_CERTIFICATE_COL].s) {
+		d->cert.s = p;
+		d->cert.len = blob_vals[BLOB_VALS_CERTIFICATE_COL].len;
+		memcpy(p, blob_vals[BLOB_VALS_CERTIFICATE_COL].s, blob_vals[BLOB_VALS_CERTIFICATE_COL].len);
+		p = p + d->cert.len;
 	}
+
 
 	if (cplist_len) {
 		d->ciphers_list = p;
@@ -209,10 +206,11 @@ int set_all_domain_attr(struct tls_domain **dom, char **str_vals, int *int_vals)
 		p = p + crl_dir_len + 1;
 	}
 
-	if (dhparams_len) {
-		d->tmp_dh_file = p;
-		memcpy(p, str_vals[STR_VALS_DHPARAMS_COL], dhparams_len);
-		p = p + dhparams_len + 1;
+	if (blob_vals[BLOB_VALS_DHPARAMS_COL].len && blob_vals[BLOB_VALS_DHPARAMS_COL].s) {
+		d->dh_param.s = p;
+		d->dh_param.len = blob_vals[BLOB_VALS_DHPARAMS_COL].len;
+		memcpy(p, blob_vals[BLOB_VALS_DHPARAMS_COL].s, blob_vals[BLOB_VALS_DHPARAMS_COL].len);
+		p = p + d->dh_param.len;
 	}
 
 	if (eccurve_len) {
@@ -221,14 +219,16 @@ int set_all_domain_attr(struct tls_domain **dom, char **str_vals, int *int_vals)
 		p = p + eccurve_len + 1;
 	}
 
-	if (pk_len) {
-		d->pkey_file = p;
-		memcpy(p, str_vals[STR_VALS_PK_COL], pk_len);
-		p = p + pk_len + 1;
+	if (blob_vals[BLOB_VALS_PK_COL].len && blob_vals[BLOB_VALS_PK_COL].s) {
+		d->pkey.s = p;
+		d->pkey.len = blob_vals[BLOB_VALS_PK_COL].len;
+		memcpy(p, blob_vals[BLOB_VALS_PK_COL].s, blob_vals[BLOB_VALS_PK_COL].len);
+		p = p + d->pkey.len;
 	}
 
 	return 0;
 }
+
 /*
  * find server domain with given ip and port
  * return default domain if virtual domain not found

@@ -33,7 +33,9 @@
 #define SIP_TRACE_TYPE_STR "sip"
 
 #define GET_SIPTRACE_CONTEXT \
-	context_get_ptr(CONTEXT_GLOBAL, current_processing_ctx, sl_ctx_idx)
+	( current_processing_ctx ? \
+	  context_get_ptr(CONTEXT_GLOBAL, current_processing_ctx, sl_ctx_idx) : \
+	  0 )
 
 #define SET_SIPTRACE_CONTEXT(st_ctx) \
 	context_put_ptr(CONTEXT_GLOBAL, current_processing_ctx, sl_ctx_idx, st_ctx)
@@ -90,6 +92,9 @@ typedef struct trace_info {
 	str *trace_attrs;
 	int trace_types;
 	tlist_elem_p trace_list;
+
+	/* connection id correlationg sip message with transport messages */
+	unsigned long long conn_id;
 } trace_info_t, *trace_info_p;
 
 /* maximum 32 types to trace; this way we'll

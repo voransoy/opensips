@@ -116,6 +116,8 @@ static cmd_export_t cmds[] = {
 	{"proto_init",            (cmd_function)proto_hep_init_tcp,        0, 0, 0, 0},
 	{"load_hep",			  (cmd_function)bind_proto_hep,        1, 0, 0, 0},
 	{"trace_bind_api",        (cmd_function)hep_bind_trace_api,    1, 0, 0, 0},
+	{"correlate", (cmd_function)correlate_w, 5, correlate_fixup, 0,
+		REQUEST_ROUTE|FAILURE_ROUTE|ONREPLY_ROUTE|BRANCH_ROUTE|LOCAL_ROUTE},
 	{0,0,0,0,0,0}
 };
 
@@ -714,6 +716,8 @@ static int hep_tcp_send (struct socket_info* send_sock,
 			}
 			/* connect succeeded, we have a connection */
 			if (n==0) {
+				/* mark the ID of the used connection (tracing purposes) */
+				last_outgoing_tcp_id = c->id;
 				/* connect is still in progress, break the sending
 				 * flow now (the actual write will be done when
 				 * connect will be completed */
@@ -751,6 +755,9 @@ static int hep_tcp_send (struct socket_info* send_sock,
 				return -1;
 			}
 
+			/* mark the ID of the used connection (tracing purposes) */
+			last_outgoing_tcp_id = c->id;
+
 			/* we succesfully added our write chunk - success */
 			tcp_conn_release(c, 0);
 			return len;
@@ -784,6 +791,9 @@ send_it:
 	either we just connected, or main sent us the FD */
 	if (c->proc_id != process_no)
 		close(fd);
+
+	/* mark the ID of the used connection (tracing purposes) */
+	last_outgoing_tcp_id = c->id;
 
 	tcp_conn_release(c, (n<len)?1:0/*pending data in async mode?*/ );
 

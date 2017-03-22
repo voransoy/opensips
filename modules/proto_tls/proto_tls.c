@@ -54,6 +54,7 @@
 #include "../../net/api_proto.h"
 #include "../../net/api_proto_net.h"
 #include "../../net/net_tcp.h"
+#include "../../net/net_tcp_report.h"
 #include "../../socket_info.h"
 #include "../../tsend.h"
 #include "../../timer.h"
@@ -66,6 +67,8 @@
 #include "../tls_mgm/api.h"
 #include "../tls_mgm/tls_conn_ops.h"
 #include "../tls_mgm/tls_conn_server.h"
+
+#include "../../net/trans_trace.h"
 
 /*
  * Open questions:
@@ -87,7 +90,6 @@
  * - we need to protect ctx by a lock -- it is in shared memory
  *   and may be accessed simultaneously
  */
-
 struct tls_mgm_binds tls_mgm_api;
 
 static int tls_port_no = SIPS_PORT;
@@ -106,6 +108,10 @@ static int proto_tls_init(struct proto_info *pi);
 static int proto_tls_init_listener(struct socket_info *si);
 static int proto_tls_send(struct socket_info* send_sock,
 		char* buf, unsigned int len, union sockaddr_union* to, int id);
+static void tls_report(int type, unsigned long long conn_id, int conn_flags,
+		void *extra);
+static struct mi_root* tls_trace_mi(struct mi_root* cmd, void* param );
+
 
 static int w_tls_blocking_write(struct tcp_connection *c, int fd, const char *buf,
 																	size_t len)
@@ -124,7 +130,17 @@ static struct tcp_req tls_current_req;
 #define _tcp_common_current_req  tls_current_req
 #include "../../net/proto_tcp/tcp_common.h"
 
+#define TLS_TRACE_PROTO "proto_hep"
 
+static str trace_destination_name = {NULL, 0};
+trace_dest t_dst;
+trace_proto_t tprot;
+
+/* module  tracing parameters */
+static int trace_is_on_tmp=1, *trace_is_on;
+static char* trace_filter_route;
+static int trace_filter_route_id = -1;
+/**/
 
 static int tls_read_req(struct tcp_connection* con, int* bytes_read);
 static int proto_tls_conn_init(struct tcp_connection* c);
@@ -140,17 +156,26 @@ static param_export_t params[] = {
 	{ "tls_crlf_pingpong",     INT_PARAM,         &tls_crlf_pingpong         },
 	{ "tls_crlf_drop",         INT_PARAM,         &tls_crlf_drop             },
 	{ "tls_max_msg_chunks",    INT_PARAM,         &tls_max_msg_chunks        },
+	{ "trace_destination",     STR_PARAM,         &trace_destination_name.s  },
+	{ "trace_on",						 INT_PARAM, &trace_is_on_tmp        },
+	{ "trace_filter_route",				 STR_PARAM, &trace_filter_route     },
 	{0, 0, 0}
 };
 
 static dep_export_t deps = {
 	{ /* OpenSIPS module dependencies */
-		{ MOD_TYPE_DEFAULT, "tls_mgm", DEP_ABORT  },
+		{ MOD_TYPE_DEFAULT, "tls_mgm"  , DEP_ABORT  },
+		{ MOD_TYPE_DEFAULT, "proto_hep", DEP_SILENT },
 		{ MOD_TYPE_NULL, NULL, 0 },
 	},
 	{ /* modparam dependencies */
 		{ NULL, NULL },
 	},
+};
+
+static mi_export_t mi_cmds[] = {
+	{ "tls_trace", 0, tls_trace_mi,   0,  0,  0 },
+	{ 0, 0, 0, 0, 0, 0}
 };
 
 struct module_exports exports = {
@@ -163,8 +188,8 @@ struct module_exports exports = {
 	0,          /* exported async functions */
 	params,     /* module parameters */
 	0,          /* exported statistics */
-	0,          /* exported MI functions */
-	NULL,          /* exported pseudo-variables */
+	mi_cmds,    /* exported MI functions */
+	NULL,       /* exported pseudo-variables */
 	0,          /* extra processes */
 	mod_init,   /* module initialization function */
 	0,          /* response function */
@@ -181,6 +206,37 @@ static int mod_init(void)
 	if(load_tls_mgm_api(&tls_mgm_api) != 0){
 		LM_DBG("failed to find tls API - is tls_mgm module loaded?\n");
 		return -1;
+	}
+
+	if (trace_destination_name.s) {
+		if ( !net_trace_api ) {
+			if ( trace_prot_bind( TLS_TRACE_PROTO, &tprot) < 0 ) {
+				LM_ERR( "can't bind trace protocol <%s>\n", TLS_TRACE_PROTO );
+				return -1;
+			}
+			net_trace_api = &tprot;
+		} else {
+			tprot = *net_trace_api;
+		}
+
+		trace_destination_name.len = strlen( trace_destination_name.s );
+
+		if ( net_trace_proto_id == -1 )
+			net_trace_proto_id = tprot.get_message_id( TRANS_TRACE_PROTO_ID );
+
+		t_dst = tprot.get_trace_dest_by_name( &trace_destination_name );
+	}
+
+	/* fix route name */
+	if ( !(trace_is_on = shm_malloc(sizeof(int))) ) {
+		LM_ERR("no more shared memory!\n");
+		return -1;
+	}
+
+	*trace_is_on = trace_is_on_tmp;
+	if ( trace_filter_route ) {
+		trace_filter_route_id =
+			get_script_route_ID_by_name( trace_filter_route, rlist, RT_NO);
 	}
 
 	return 0;
@@ -215,6 +271,7 @@ static int proto_tls_init(struct proto_info *pi)
 	pi->net.read			= (proto_net_read_f)tls_read_req;
 	pi->net.conn_init		= proto_tls_conn_init;
 	pi->net.conn_clean		= tls_conn_clean;
+	pi->net.report			= tls_report;
 
 	return 0;
 }
@@ -244,9 +301,55 @@ error:
 
 static int proto_tls_conn_init(struct tcp_connection* c)
 {
+	struct tls_data* data;
+
+	if ( t_dst && tprot.create_trace_message ) {
+		/* this message shall be used in first send function */
+		data = shm_malloc( sizeof(struct tls_data) );
+		if ( !data ) {
+			LM_ERR("no more pkg mem!\n");
+			goto out;
+		}
+		memset( data, 0, sizeof(struct tls_data) );
+
+		if ( t_dst && tprot.create_trace_message) {
+			data->tprot = &tprot;
+			data->dest  = t_dst;
+			data->net_trace_proto_id = net_trace_proto_id;
+			data->trace_is_on = trace_is_on;
+			data->trace_route_id = trace_filter_route_id;
+		}
+
+		c->proto_data = data;
+	} else {
+		c->proto_data = 0;
+	}
+
+out:
 	return tls_conn_init(c, &tls_mgm_api);
 }
 
+static void tls_report(int type, unsigned long long conn_id, int conn_flags,
+																void *extra)
+{
+	str s;
+
+	if (type==TCP_REPORT_CLOSE) {
+		if ( !*trace_is_on || (conn_flags & F_CONN_TRACE_DROPPED) )
+			return;
+
+		/* grab reason text */
+		if (extra) {
+			s.s = (char*)extra;
+			s.len = strlen (s.s);
+		}
+
+		trace_message_atonce( PROTO_TLS, conn_id, NULL/*src*/, NULL/*dst*/,
+			TRANS_TRACE_CLOSED, TRANS_TRACE_SUCCESS, extra?&s:NULL, t_dst );
+	}
+
+	return;
+}
 
 static struct tcp_connection* tls_sync_connect(struct socket_info* send_sock,
 		union sockaddr_union* server, int *fd)
@@ -300,6 +403,8 @@ static int proto_tls_send(struct socket_info* send_sock,
 	int port;
 	int fd, n;
 
+	struct tls_data* data;
+
 	if (to){
 		su2ip_addr(&ip, to);
 		port=su_getport(to);
@@ -341,6 +446,20 @@ static int proto_tls_send(struct socket_info* send_sock,
 	}
 
 send_it:
+	if ( c->proto_flags & F_TLS_TRACE_READY ) {
+		data = c->proto_data;
+		/* send the message if set from tls_mgm */
+		if ( data->message ) {
+			send_trace_message( data->message, t_dst);
+		}
+
+		/* don't allow future traces for this connection */
+		data->tprot = 0;
+		data->dest  = 0;
+
+		c->proto_flags &= ~( F_TLS_TRACE_READY );
+	}
+
 	LM_DBG("sending via fd %d...\n",fd);
 
 	n = tls_blocking_write(c, fd, buf, len, &tls_mgm_api);
@@ -362,16 +481,21 @@ send_it:
 	if (c->proc_id != process_no)
 		close(fd);
 
+	/* mark the ID of the used connection (tracing purposes) */
+	last_outgoing_tcp_id = c->id;
+
 	tcp_conn_release(c, 0);
 	return n;
 }
 
-
 static int tls_read_req(struct tcp_connection* con, int* bytes_read)
 {
+	int ret;
 	int bytes;
 	int total_bytes;
 	struct tcp_req* req;
+
+	struct tls_data* data;
 
 	bytes=-1;
 	total_bytes=0;
@@ -385,10 +509,29 @@ static int tls_read_req(struct tcp_connection* con, int* bytes_read)
 		req=&tls_current_req;
 	}
 
-	if (tls_fix_read_conn(con)!=0) {
+	/* do this trick in order to trace whether if it's an error or not */
+	ret=tls_fix_read_conn(con);
+
+	if ( con->proto_flags & F_TLS_TRACE_READY ) {
+		data = con->proto_data;
+		/* send the message if set from tls_mgm */
+		if ( data->message ) {
+			tprot.send_message( data->message, t_dst, 0);
+			tprot.free_message( data->message );
+		}
+
+		/* don't allow future traces for this connection */
+		data->tprot = 0;
+		data->dest  = 0;
+
+		con->proto_flags &= ~( F_TLS_TRACE_READY );
+	}
+
+	if ( ret != 0 ) {
 		LM_ERR("failed to do pre-tls reading\n");
 		goto error;
 	}
+
 	if(con->state!=S_CONN_OK)
 		goto done; /* not enough data */
 
@@ -455,3 +598,45 @@ error:
 	return -1;
 }
 
+static struct mi_root* tls_trace_mi(struct mi_root* cmd_tree, void* param )
+{
+	struct mi_node* node;
+
+	struct mi_node *rpl;
+	struct mi_root *rpl_tree ;
+
+	node = cmd_tree->node.kids;
+	if(node == NULL) {
+		/* display status on or off */
+		rpl_tree = init_mi_tree( 200, MI_SSTR(MI_OK));
+		if (rpl_tree == 0)
+			return 0;
+		rpl = &rpl_tree->node;
+
+		if ( *trace_is_on ) {
+			node = add_mi_node_child(rpl,0,MI_SSTR("TLS tracing"),MI_SSTR("on"));
+		} else {
+			node = add_mi_node_child(rpl,0,MI_SSTR("TLS tracing"),MI_SSTR("off"));
+		}
+
+		return rpl_tree ;
+	} else if ( node && !node->next ) {
+		if ( (node->value.s[0] | 0x20) == 'o' &&
+				(node->value.s[1] | 0x20) == 'n' ) {
+			*trace_is_on = 1;
+			return init_mi_tree( 200, MI_SSTR(MI_OK));
+		} else
+		if ( (node->value.s[0] | 0x20) == 'o' &&
+				(node->value.s[1] | 0x20) == 'f' &&
+				(node->value.s[2] | 0x20) == 'f' ) {
+			*trace_is_on = 0;
+			return init_mi_tree( 200, MI_SSTR(MI_OK));
+		} else {
+			return init_mi_tree( 500, MI_SSTR(MI_INTERNAL_ERR));
+		}
+	} else {
+		return init_mi_tree( 500, MI_SSTR(MI_INTERNAL_ERR));
+	}
+
+	return NULL;
+}

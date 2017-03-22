@@ -70,15 +70,16 @@
 /*!< Maximum number of port aliases */
 #define TCP_CON_MAX_ALIASES  4
 
-/*!< the max number of seconds that a child waits  until the message is 
+/*!< the max number of seconds that a child waits  until the message is
  * read completely - anything above will lead to the connection being closed
  * and considered an attack */
 #define TCP_CHILD_MAX_MSG_TIME  4
 
 /* tcp connection flags */
-#define F_CONN_NON_BLOCKING (1<<0)
-#define F_CONN_REMOVED      (1<<1) /*!< no longer in "main" listen fd list */
-#define F_CONN_ACCEPTED     (1<<2) /*!< created after a connect event */
+#define F_CONN_NON_BLOCKING		(1<<0)
+#define F_CONN_REMOVED			(1<<1) /*!< no longer in "main" listen fd list */
+#define F_CONN_ACCEPTED			(1<<2) /*!< created after a connect event */
+#define F_CONN_TRACE_DROPPED	(1<<3) /*!< tracing dropped on this connection */
 
 enum tcp_conn_states { S_CONN_ERROR=-2, S_CONN_BAD=-1, S_CONN_OK=0,
 		S_CONN_CONNECTING, S_CONN_EOF };
@@ -102,6 +103,7 @@ struct tcp_connection{
 	int proc_id;				/*!< used only by "children", contains the pt table ID of the TCP worker currently holding the connection, or -1 if in TCP main */
 	gen_lock_t write_lock;
 	int id;					/*!< id (unique!) used to retrieve a specific connection when reply-ing*/
+	unsigned long long cid;					/*!< connection id (unique!) used to uniquely identify connections across space and time */
 	struct receive_info rcv;		/*!< src & dst ip, ports, proto a.s.o*/
 	volatile int refcnt;
 	enum sip_protos type;			/*!< PROTO_TCP or a protocol over it, e.g. TLS */

@@ -35,10 +35,12 @@
 #include "../../net/net_tcp.h"
 #include "../../net/api_proto.h"
 #include "../../net/api_proto_net.h"
+#include "../../net/net_tcp_report.h"
 #include "../../socket_info.h"
 #include "../../tsend.h"
 #include "../../receive.h"
 #include "../../timer.h"
+#include "../../net/trans_trace.h"
 #include "proto_ws.h"
 #include "ws_tcp.h"
 #include "ws_common_defs.h"
@@ -71,6 +73,18 @@ static str ws_resource = str_init("/");
 #include "ws_handshake_common.h"
 #include "ws_common.h"
 
+#define WS_TRACE_PROTO "proto_hep"
+#define WS_TRANS_TRACE_PROTO_ID "trans"
+static str trace_destination_name = {NULL, 0};
+trace_dest t_dst;
+trace_proto_t tprot;
+
+/* module  tracing parameters */
+static int trace_is_on_tmp=1, *trace_is_on;
+static char* trace_filter_route;
+static int trace_filter_route_id = -1;
+/**/
+
 static int mod_init(void);
 static int proto_ws_init(struct proto_info *pi);
 static int proto_ws_init_listener(struct socket_info *si);
@@ -79,6 +93,10 @@ static int proto_ws_send(struct socket_info* send_sock,
 static int ws_read_req(struct tcp_connection* con, int* bytes_read);
 static int ws_conn_init(struct tcp_connection* c);
 static void ws_conn_clean(struct tcp_connection* c);
+static void ws_report(int type, unsigned long long conn_id, int conn_flags,
+		void *extra);
+static struct mi_root* ws_trace_mi(struct mi_root* cmd, void* param );
+
 
 static int ws_port = WS_DEFAULT_PORT;
 
@@ -96,21 +114,39 @@ static param_export_t params[] = {
 	{ "ws_send_timeout",   INT_PARAM, &ws_send_timeout   },
 	{ "ws_resource",       STR_PARAM, &ws_resource       },
 	{ "ws_handshake_timeout", INT_PARAM, &ws_hs_read_tout },
+	{ "trace_destination",     STR_PARAM,         &trace_destination_name.s  },
+	{ "trace_on",						 INT_PARAM, &trace_is_on_tmp        },
+	{ "trace_filter_route",				 STR_PARAM, &trace_filter_route     },
 	{0, 0, 0}
 };
 
+static dep_export_t deps = {
+	{ /* OpenSIPS module dependencies */
+		{ MOD_TYPE_DEFAULT, "proto_hep", DEP_SILENT },
+		{ MOD_TYPE_NULL, NULL, 0 },
+	},
+	{ /* modparam dependencies */
+		{ NULL, NULL },
+	},
+};
+
+
+static mi_export_t mi_cmds[] = {
+	{ "ws_trace", 0, ws_trace_mi,   0,  0,  0 },
+	{ 0, 0, 0, 0, 0, 0}
+};
 
 struct module_exports exports = {
 	PROTO_PREFIX "ws",  /* module name*/
 	MOD_TYPE_DEFAULT,/* class of this module */
 	MODULE_VERSION,
 	DEFAULT_DLFLAGS, /* dlopen flags */
-	NULL,            /* OpenSIPS module dependencies */
+	&deps,            /* OpenSIPS module dependencies */
 	cmds,       /* exported functions */
 	0,          /* exported async functions */
 	params,     /* module parameters */
 	0,          /* exported statistics */
-	0,          /* exported MI functions */
+	mi_cmds,    /* exported MI functions */
 	0,          /* exported pseudo-variables */
 	0,          /* extra processes */
 	mod_init,   /* module initialization function */
@@ -136,6 +172,7 @@ static int proto_ws_init(struct proto_info *pi)
 
 	pi->net.conn_init		= ws_conn_init;
 	pi->net.conn_clean		= ws_conn_clean;
+	pi->net.report			= ws_report;
 
 	return 0;
 }
@@ -144,6 +181,39 @@ static int proto_ws_init(struct proto_info *pi)
 static int mod_init(void)
 {
 	LM_INFO("initializing WebSocket protocol\n");
+
+	if (trace_destination_name.s) {
+		if ( !net_trace_api ) {
+			if ( trace_prot_bind( WS_TRACE_PROTO, &tprot) < 0 ) {
+				LM_ERR( "can't bind trace protocol <%s>\n", WS_TRACE_PROTO );
+				return -1;
+			}
+
+			net_trace_api = &tprot;
+		} else {
+			tprot = *net_trace_api;
+		}
+
+		trace_destination_name.len = strlen( trace_destination_name.s );
+
+		if ( net_trace_proto_id == -1 )
+			net_trace_proto_id = tprot.get_message_id( WS_TRANS_TRACE_PROTO_ID );
+
+		t_dst = tprot.get_trace_dest_by_name( &trace_destination_name );
+	}
+
+	/* fix route name */
+	if ( !(trace_is_on = shm_malloc(sizeof(int))) ) {
+		LM_ERR("no more shared memory!\n");
+		return -1;
+	}
+
+	*trace_is_on = trace_is_on_tmp;
+	if ( trace_filter_route ) {
+		trace_filter_route_id =
+			get_script_route_ID_by_name( trace_filter_route, rlist, RT_NO);
+	}
+
 	return 0;
 }
 
@@ -158,6 +228,16 @@ static int ws_conn_init(struct tcp_connection* c)
 		LM_ERR("failed to create ws states in shm mem\n");
 		return -1;
 	}
+	memset( d, 0, sizeof( struct ws_data ) );
+
+	if ( t_dst && tprot.create_trace_message ) {
+		d->tprot = &tprot;
+		d->dest = t_dst;
+		d->net_trace_proto_id = net_trace_proto_id;
+		d->trace_is_on = trace_is_on;
+		d->trace_route_id = trace_filter_route_id;
+	}
+
 	d->state = WS_CON_INIT;
 	d->type = WS_NONE;
 	d->code = WS_ERR_NONE;
@@ -195,6 +275,30 @@ static int proto_ws_init_listener(struct socket_info *si)
 	 * transparently use the generic listener init from net TCP layer */
 	return tcp_init_listener(si);
 }
+
+static void ws_report(int type, unsigned long long conn_id, int conn_flags,
+																void *extra)
+{
+	str s;
+
+	if (type==TCP_REPORT_CLOSE) {
+		if ( !*trace_is_on || (conn_flags & F_CONN_TRACE_DROPPED) )
+			return;
+		/* grab reason text */
+
+		if (extra) {
+			s.s = (char*)extra;
+			s.len = strlen (s.s);
+		}
+
+		trace_message_atonce( PROTO_WS, conn_id, NULL/*src*/, NULL/*dst*/,
+			TRANS_TRACE_CLOSED, TRANS_TRACE_SUCCESS, extra?&s:NULL, t_dst );
+	}
+
+	return;
+}
+
+
 
 static struct tcp_connection* ws_sync_connect(struct socket_info* send_sock,
 		union sockaddr_union* server)
@@ -293,6 +397,8 @@ static int proto_ws_send(struct socket_info* send_sock,
 	int port = 0;
 	int fd, n;
 
+	struct ws_data* d;
+
 	reset_tcp_vars(tcpthreshold);
 	start_expire_timer(get,tcpthreshold);
 
@@ -326,6 +432,19 @@ static int proto_ws_send(struct socket_info* send_sock,
 			LM_ERR("connect failed\n");
 			return -1;
 		}
+
+		d = c->proto_data;
+
+		if ( d && d->dest && d->tprot ) {
+			if ( d->message ) {
+				send_trace_message( d->message, t_dst);
+			}
+
+			/* don't allow future traces for this cnection */
+			d->tprot = 0;
+			d->dest  = 0;
+		}
+
 		goto send_it;
 	}
 	get_time_difference(get, tcpthreshold, tcp_timeout_con_get);
@@ -361,6 +480,9 @@ send_it:
 	if (c->proc_id != process_no)
 		close(fd);
 
+	/* mark the ID of the used connection (tracing purposes) */
+	last_outgoing_tcp_id = c->id;
+
 	tcp_conn_release(c, 0);
 	return n;
 }
@@ -380,14 +502,26 @@ send_it:
 static int ws_read_req(struct tcp_connection* con, int* bytes_read)
 {
 	int size;
+	struct ws_data* d;
 
 	if (WS_STATE(con) != WS_CON_HANDSHAKE_DONE) {
-
 		size = ws_server_handshake(con);
 		if (size < 0) {
 			LM_ERR("cannot complete WebSocket handshake\n");
 			goto error;
 		}
+
+		d = con->proto_data;
+		if ( d && d->dest && d->tprot ) {
+			if ( d->message ) {
+				send_trace_message( d->message, t_dst);
+			}
+
+			/* don't allow future traces for this connection */
+			d->tprot = 0;
+			d->dest  = 0;
+		}
+
 		if (size == 0)
 			goto done;
 	}
@@ -401,6 +535,45 @@ error:
 	return -1;
 }
 
+static struct mi_root* ws_trace_mi(struct mi_root* cmd_tree, void* param )
+{
+	struct mi_node* node;
 
+	struct mi_node *rpl;
+	struct mi_root *rpl_tree ;
 
+	node = cmd_tree->node.kids;
+	if(node == NULL) {
+		/* display status on or off */
+		rpl_tree = init_mi_tree( 200, MI_SSTR(MI_OK));
+		if (rpl_tree == 0)
+			return 0;
+		rpl = &rpl_tree->node;
 
+		if ( *trace_is_on ) {
+			node = add_mi_node_child(rpl,0,MI_SSTR("WS tracing"),MI_SSTR("on"));
+		} else {
+			node = add_mi_node_child(rpl,0,MI_SSTR("WS tracing"),MI_SSTR("off"));
+		}
+
+		return rpl_tree ;
+	} else if ( node && !node->next ) {
+		if ( (node->value.s[0] | 0x20) == 'o' &&
+				(node->value.s[1] | 0x20) == 'n' ) {
+			*trace_is_on = 1;
+			return init_mi_tree( 200, MI_SSTR(MI_OK));
+		} else
+		if ( (node->value.s[0] | 0x20) == 'o' &&
+				(node->value.s[1] | 0x20) == 'f' &&
+				(node->value.s[2] | 0x20) == 'f' ) {
+			*trace_is_on = 0;
+			return init_mi_tree( 200, MI_SSTR(MI_OK));
+		} else {
+			return init_mi_tree( 500, MI_SSTR(MI_INTERNAL_ERR));
+		}
+	} else {
+		return init_mi_tree( 500, MI_SSTR(MI_INTERNAL_ERR));
+	}
+
+	return NULL;
+}

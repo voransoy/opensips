@@ -33,7 +33,6 @@
 #include "../../mod_fix.h"
 #include "../../rw_locking.h"
 #include "../../usr_avp.h"
-
 #include "../dialog/dlg_load.h"
 #include "../tm/tm_load.h"
 #include "../freeswitch/fs_api.h"
@@ -41,9 +40,9 @@
 #include "lb_parser.h"
 #include "lb_db.h"
 #include "lb_data.h"
+#include "lb_replication.h"
 #include "lb_prober.h"
 #include "lb_bl.h"
-
 
 
 /* db stuff */
@@ -115,9 +114,11 @@ static int w_lb_count_call(struct sip_msg *req, char *ip, char *port, char *grp,
 
 
 static void lb_prob_handler(unsigned int ticks, void* param);
+
 static void lb_update_max_loads(unsigned int ticks, void *param);
 
-
+void receive_lb_binary_packet(enum clusterer_event ev, bin_packet_t *packet, int packet_type,
+				struct receive_info *ri, int cluster_id, int src_id, int dest_id);
 
 
 static cmd_export_t cmds[]={
@@ -164,7 +165,9 @@ static param_export_t mod_params[]={
 	{ "probing_from",          STR_PARAM, &lb_probe_from.s          },
 	{ "probing_reply_codes",   STR_PARAM, &lb_probe_replies.s       },
 	{ "lb_define_blacklist",   STR_PARAM|USE_FUNC_PARAM, (void*)set_lb_bl},
-	{ "fetch_freeswitch_stats", INT_PARAM, &fetch_freeswitch_stats},
+	{ "accept_replicated_status",INT_PARAM, &accept_replicated_status },
+	{ "replicate_status_to",     INT_PARAM, &replicated_status_cluster },
+	{ "fetch_freeswitch_stats",  INT_PARAM, &fetch_freeswitch_stats},
 	{ "initial_freeswitch_load", INT_PARAM, &initial_fs_load},
 	{ 0,0,0 }
 };
@@ -177,6 +180,14 @@ static mi_export_t mi_cmds[] = {
 	{ "lb_status",   0, mi_lb_status,   0,                  0,  0},
 	{ 0, 0, 0, 0, 0, 0}
 };
+
+static module_dependency_t *get_deps_clusterer(param_export_t *param)
+{
+	int cluster_id = *(int *)param->param_pointer;
+	if (cluster_id <= 0)
+		return NULL;
+	return alloc_module_dep(MOD_TYPE_DEFAULT, "clusterer", DEP_ABORT);
+}
 
 static module_dependency_t *get_deps_probing_interval(param_export_t *param)
 {
@@ -201,8 +212,10 @@ static dep_export_t deps = {
 		{ MOD_TYPE_NULL, NULL, 0 },
 	},
 	{ /* modparam dependencies */
-		{ "probing_interval",      get_deps_probing_interval },
+		{ "probing_interval", get_deps_probing_interval },
 		{ "fetch_freeswitch_stats", get_deps_fetch_fs_load },
+		{ "accept_replicated_status", get_deps_clusterer},
+		{ "replicate_status_to", get_deps_clusterer},
 		{ NULL, NULL },
 	},
 };
@@ -545,6 +558,25 @@ static int mod_init(void)
 
 	if (lb_init_event() < 0) {
 		LM_ERR("cannot init event\n");
+		return -1;
+	}
+
+	if (replicated_status_cluster < 0) {
+		LM_ERR("Invalid replicated_status_cluster, must be 0 or "
+			"a positive cluster id\n");
+		return -1;
+	}
+
+	if( (replicated_status_cluster > 0 || accept_replicated_status > 0)
+		&& load_clusterer_api(&clusterer_api)!=0) {
+		LM_DBG("failed to find clusterer API - is clusterer module loaded?\n");
+		return -1;
+	}
+
+	/* register handler for processing load_balancer replication packets to the clusterer module */
+	if (accept_replicated_status > 0 && clusterer_api.register_module(repl_lb_module_name.s,
+		receive_lb_binary_packet, 1, &accept_replicated_status, 1) < 0) {
+		LM_ERR("cannot register binary packet callback to clusterer module!\n");
 		return -1;
 	}
 
@@ -920,7 +952,7 @@ void set_dst_state_from_rplcode( int id, int code)
 		old_flags = dst->flags;
 		dst->flags &= ~LB_DST_STAT_DSBL_FLAG;
 		if (dst->flags != old_flags) {
-			lb_raise_event(dst);
+			lb_status_changed(dst);
 			if (lb_prob_verbose)
 				LM_INFO("re-enable destination %d <%.*s> after %d reply "
 					"on probe\n", dst->id, dst->uri.len, dst->uri.s, code);
@@ -933,7 +965,7 @@ void set_dst_state_from_rplcode( int id, int code)
 		old_flags = dst->flags;
 		dst->flags |= LB_DST_STAT_DSBL_FLAG;
 		if (dst->flags != old_flags) {
-			lb_raise_event(dst);
+			lb_status_changed(dst);
 			if (lb_prob_verbose)
 				LM_INFO("disable destination %d <%.*s> after %d reply "
 					"on probe\n", dst->id, dst->uri.len, dst->uri.s, code);
@@ -1152,7 +1184,7 @@ static struct mi_root* mi_lb_status(struct mi_root *cmd, void *param)
 						LB_DST_STAT_DSBL_FLAG|LB_DST_STAT_NOEN_FLAG;
 				}
 				if (old_flags != dst->flags) {
-					lb_raise_event(dst);
+					lb_status_changed(dst);
 					if( lb_prob_verbose )
 						LM_INFO("manually %s destination %d <%.*s>\n",
 							(stat ? "enable" : "disable"),
@@ -1258,4 +1290,32 @@ error:
 	lock_stop_read( ref_lock );
 	free_mi_tree(rpl_tree);
 	return 0;
+}
+
+
+void receive_lb_binary_packet(enum clusterer_event ev, bin_packet_t *packet, int packet_type,
+				struct receive_info *ri, int cluster_id, int src_id, int dest_id)
+{
+	LM_DBG("received a binary packet [%d]!\n", packet_type);
+
+	if (ev == CLUSTER_NODE_DOWN || ev == CLUSTER_NODE_UP)
+		return;
+	else if (ev == CLUSTER_ROUTE_FAILED) {
+		LM_INFO("Failed to route replication packet of type %d from node id: %d "
+			"to node id: %d in cluster: %d\n", cluster_id, packet_type, src_id, dest_id);
+		return;
+	}
+
+	if(get_bin_pkg_version(packet) != BIN_VERSION) {
+		LM_ERR("incompatible bin protocol version\n");
+		return;
+	}
+
+	if (packet_type == REPL_LB_STATUS_UPDATE) {
+		lock_start_read(ref_lock);
+		replicate_lb_status_update(packet, *curr_data);
+		lock_stop_read(ref_lock);
+	} else {
+		LM_ERR("invalid load_balancer binary packet type: %d\n", packet_type);
+	}
 }
