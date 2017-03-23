@@ -140,8 +140,8 @@ struct cgr_acc_ctx *cgr_tryget_acc_ctx(void)
 				cgr_free_sess(sa);
 			} else {
 				/* move the dict in the local ctx */
-				list_del(&s->list);
-				list_add(&s->list, ctx->sessions);
+				list_del(&sa->list);
+				list_add(&sa->list, ctx->sessions);
 			}
 		}
 		shm_free(acc_ctx->sessions);
@@ -366,10 +366,12 @@ static json_object *cgr_get_start_acc_msg(struct sip_msg *msg,
 	}
 
 	/* AnswerTime */
-	stime.s = int2str(ctx->answer_time, &stime.len);
-	if (cgr_msg_push_str(cmsg, "AnswerTime", &stime) < 0) {
-		LM_ERR("cannot push AnswerTime info!\n");
-		goto error;
+	if (ctx) {
+		stime.s = int2str(ctx->answer_time, &stime.len);
+		if (cgr_msg_push_str(cmsg, "AnswerTime", &stime) < 0) {
+			LM_ERR("cannot push AnswerTime info!\n");
+			goto error;
+		}
 	}
 
 	/* Destination */
@@ -395,6 +397,11 @@ static json_object *cgr_get_stop_acc_msg(struct sip_msg *msg,
 	static str cmd = str_init("SMGenericV1.TerminateSession");
 	str *callid;
 	str tmp;
+
+	if (!ctx) {
+		LM_BUG("ended up in stop accounting with no context!\n");
+		return NULL;
+	}
 
 	ctx->duration = now - ctx->answer_time;
 

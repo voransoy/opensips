@@ -813,7 +813,7 @@ static int fixup_all_stats(void ** param, int param_no)
 			LM_ERR("out of mem!\n");
 			return E_OUT_OF_MEM;
 		}
-		if (pv_parse_spec(&name, e) < 0) {
+		if (pv_parse_spec(&name, e) == 0) {
 			LM_ERR("invalid spec %s\n", name.s);
 			return E_SCRIPT;
 		}
@@ -4221,7 +4221,6 @@ static int rtpp_init_extra_stats(void)
 	return 0;
 
 error:
-	rtpp_stats_no = rtpp_stats_no;
 	rtpp_stats_chunks_no = chunk;
 	rtpp_stats_no = chunk * RTPP_QUERY_ONCE_STATS_NO;
 	return -1;
