@@ -36,6 +36,7 @@ addons:
             - liblua5.1-0-dev
             - libncurses5-dev
             - libjson0-dev
+            - libuuid1
     coverity_scan:
         project:
             name: OpenSIPS/opensips
