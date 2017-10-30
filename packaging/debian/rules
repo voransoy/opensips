@@ -48,20 +48,31 @@ endif
 
 # List of all debian module packages we will build
 # Used to index the make variable below, which has details about each package
-#
-# LUA has been removed due to libmemcache dependency.
-#     See https://github.com/OpenSIPS/opensips/issues/580
 ALL_MODPKG_LIST := \
 	MYSQL POSTGRES UNIXODBC SQLITE JABBER CPL RADIUS \
 	PRESENCE XMLRPC PERL SNMPSTATS XMPP CROUTE BERKELEY LDAP \
 	GEOIP REGEX IDENTITY B2BUA DBHTTP DIALPLAN MEMCACHED JSON \
 	REDIS RABBITMQ HTTP COMPRESSION EMERGENCY \
 	PROTO_TLS PROTO_WSS TLS_MGM REST_CLIENT LUA \
-	SQLITE CGRATES XML MONGODB SIPREC
+	SQLITE CGRATES XML SIPREC
 # add SCTP only on linux systems
 ifeq ($(DEB_HOST_ARCH_OS),linux)
 	ALL_MODPKG_LIST += PROTO_SCTP
 endif
+
+MAJOR_RELEASE=$(shell lsb_release -rs | cut -d "." -f 1)
+
+# use a dummy architecture for the packages we do not want to build
+ifeq ($(shell dpkg-vendor --derives-from Debian && echo yes),yes)
+	LIBMONGOC_MAJOR_RELEASE=9
+endif
+ifeq ($(shell dpkg-vendor --derives-from Ubuntu && echo yes),yes)
+	LIBMONGOC_MAJOR_RELEASE=16
+endif
+ifeq ($(shell test $(MAJOR_RELEASE) -ge $(LIBMONGOC_MAJOR_RELEASE); echo $$?),0)
+	ALL_MODPKG_LIST += MONGODB
+endif
+RADCLI_MAJOR_RELEASE=$(LIBMONGOC_MAJOR_RELEASE)
 
 ifeq ($(BUILD_MODPKG_LIST),NONE)
 override BUILD_MODPKG_LIST :=
@@ -243,8 +254,11 @@ LDFLAGS += $(shell dpkg-buildflags --get LDFLAGS)
 # force multiach lib path and SMP support all the time
 VARS = LIBDIR=lib/$(DEB_HOST_MULTIARCH) ISSMP=yes
 
-# Only radcli is supported now
-VARS += RADIUSCLIENT=RADCLI
+ifeq ($(shell test $(MAJOR_RELEASE) -ge $(RADCLI_MAJOR_RELEASE); echo $$?),0)
+	VARS += RADIUSCLIENT=RADCLI
+else
+	VARS += RADIUSCLIENT=FREERADIUS
+endif
 
 ifeq (,$(findstring nostrip,$(DEB_BUILD_OPTIONS)))
 	INSTALL_PROGRAM += -s
