@@ -38,6 +38,8 @@
 #include "../../net/trans_trace.h"
 #include "../../socket_info.h"
 #include "../../tsend.h"
+#include "../../trace_api.h"
+
 #include "tcp_common_defs.h"
 #include "proto_tcp_handler.h"
 

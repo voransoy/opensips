@@ -260,8 +260,8 @@ lcache_con* lcache_new_connection(struct cachedb_id* id)
 	lcache_con *con;
 	lcache_col_t* it;
 
-	if (id->flags != CACHEDB_ID_NO_URL) {
-		LM_ERR("bogus url for local cachedb\n");
+	if (id == NULL) {
+		LM_ERR("null db_id\n");
 		return 0;
 	}
 

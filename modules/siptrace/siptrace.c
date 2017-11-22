@@ -2563,14 +2563,6 @@ static int pipport2su (str *sproto, str *ip, unsigned short port,
 
 	if (port == 0)
 		port = SIP_PORT;
-	else {
-	/*the address contains a port number*/
-		if (port<1024)
-		{
-			LM_ERR("invalid port number; must be in [1024,65536]\n");
-			return -1;
-		}
-	}
 	LM_DBG("proto %d, host %.*s , port %d \n",*proto, ip->len, ip->s, port);
 
 	/* now IPv6 address has no brakets. It should be fixed! */

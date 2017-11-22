@@ -515,11 +515,11 @@ error:
 
 static int evi_print_subscriber(struct mi_node *rpl, evi_subs_p subs)
 {
-	evi_reply_sock *sock = subs != NULL ? subs->reply_sock : NULL;
-	struct mi_node *node = NULL;
+	evi_reply_sock *sock;
+	struct mi_node *node;
 	str socket;
 
-	if (!subs->trans_mod || !subs->trans_mod->print) {
+	if (!subs || !subs->trans_mod || !subs->trans_mod->print) {
 		LM_ERR("subscriber does not have a print method exported\n");
 		return -1;
 	}

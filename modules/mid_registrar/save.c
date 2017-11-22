@@ -2389,9 +2389,11 @@ int mid_reg_save(struct sip_msg *msg, char *dom, char *flags_gp,
 	}
 
 	if (get_first_contact(msg) == NULL) {
-		if (st)
+		if (st) {
 			sctx.star = 1;
-		return prepare_forward(msg, ud, &sctx.aor, &sctx);
+			return prepare_forward(msg, ud, &sctx);
+		}
+		goto quick_reply;
 	}
 
 	/* in mirror mode, all REGISTER requests simply pass through */
@@ -2416,6 +2418,7 @@ int mid_reg_save(struct sip_msg *msg, char *dom, char *flags_gp,
 	else if (rc == 1)
 		goto out_forward;
 
+quick_reply:
 	/* forwarding not needed! This REGISTER will be absorbed */
 
 	/* prepare the Contact header field for a quick 200 OK response */
