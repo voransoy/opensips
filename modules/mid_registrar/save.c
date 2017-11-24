@@ -1404,7 +1404,7 @@ static inline int save_restore_req_contacts(struct sip_msg *req, struct sip_msg*
 			len += sprintf(buf + len, "\r\n");
 
 		anchor = anchor_lump(rpl, rpl->unparsed - rpl->buf, 0);
-		if (insert_new_lump_after(anchor, buf, len, HDR_CONTACT_T) == NULL) {
+		if (!anchor || insert_new_lump_after(anchor, buf, len, HDR_CONTACT_T) == NULL) {
 			pkg_free(buf);
 			goto out_clear_err;
 		}
