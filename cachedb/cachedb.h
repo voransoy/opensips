@@ -111,6 +111,8 @@ typedef struct cachedb_funcs_t {
 	 * @con: The cacheDB connection to use.
 	 * @filter: NULL, one or more AND'ed filters for the query.
 	 * @res: Will contain zero or more results.
+	 *
+	 * Return: 0 on success, -1 otherwise. @res is always safe to free.
 	 */
 	cachedb_query_f         *query;
 
@@ -131,6 +133,8 @@ typedef struct cachedb_funcs_t {
 	 * backends may only support row-level TTLs and set a TTL equal to the
 	 * max TTL between all input and existing DB TTL (e.g. MongoDB), others
 	 * may actually fully support dictionary-level TTLs (e.g. Cassandra).
+	 *
+	 * Return: 0 on success, -1 otherwise.
 	 */
 	cachedb_update_f        *update;
 	/* TODO: can we also implement these ^ with Redis, or can we adapt them? */
